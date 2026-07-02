@@ -37,8 +37,8 @@ contract EverlastingMarket {
     function intrinsicWad() public view returns (uint256) {
         uint256 s = oracle.spotWad();
         if (side == Side.PUT) {
-            uint256 v = s >= K ? 0 : K - s;
-            return v > W ? W : v;                 // clamp to max payout (no-op when W==K)
+            uint256 pv = s >= K ? 0 : K - s;
+            return pv > W ? W : pv;                 // clamp to max payout (no-op when W==K)
         }
         // CALL: clamp(S - K, 0, W)
         uint256 v = s <= K ? 0 : s - K;
