@@ -13,6 +13,10 @@ contract EverlastingMarket {
     uint256 public immutable W;          // max payout per unit, WAD (PUT: K; CALL: K_hi-K)
     address public immutable lp;         // sole LP (Slice-1/2) = deployer
     address public keeper;
+    address public owner;
+    uint256 public protocolFeeBps;   // cut of funding carry, <= MAX_FEE_BPS
+    uint256 public feeAccrued;       // USDC owed to protocol
+    uint256 public constant MAX_FEE_BPS = 2000;
     uint256 public lastIntrinsic;        // intrinsic sampled at the last postMark (WAD)
 
     uint256 public poolFree;    // USDC available (in-contract)
@@ -32,6 +36,19 @@ contract EverlastingMarket {
     constructor(IERC20 _usdc, ISpotOracle _oracle, Side _side, uint256 _K, uint256 _W, address _keeper) {
         require(_W > 0, "W=0");
         usdc = _usdc; oracle = _oracle; side = _side; K = _K; W = _W; keeper = _keeper; lp = msg.sender;
+        owner = msg.sender;
+    }
+
+    function setProtocolFeeBps(uint256 bps) external {
+        require(msg.sender == owner, "only owner");
+        require(bps <= MAX_FEE_BPS, "fee too high");
+        protocolFeeBps = bps;
+    }
+    function withdrawFees(address to, uint256 amt) external {
+        require(msg.sender == owner, "only owner");
+        require(amt <= feeAccrued, "fee: insufficient");
+        feeAccrued -= amt;
+        require(usdc.transfer(to, amt), "transfer");
     }
 
     function intrinsicWad() public view returns (uint256) {
@@ -154,6 +171,14 @@ contract EverlastingMarket {
             uint256 l = uint256(-netU);
             if (l > col) l = col;                     // auto-settle floor: never below 0
             col -= l; poolFree += l;
+        }
+
+        // Protocol fee = cut of funding carry, taken from pool surplus AFTER the trader is
+        // paid, floored at poolFree so it can never cause a trader-payout shortfall.
+        if (protocolFeeBps > 0 && fundingU > 0) {
+            uint256 feeU = fundingU * protocolFeeBps / 10_000;
+            if (feeU > poolFree) feeU = poolFree;
+            poolFree -= feeU; feeAccrued += feeU;
         }
 
         traderCollateral[t] = col;
