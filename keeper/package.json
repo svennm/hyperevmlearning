@@ -1,0 +1,3 @@
+{ "name":"everlasting-keeper","private":true,"type":"module",
+  "scripts":{"post":"tsx postMark.ts"},
+  "dependencies":{"ethers":"^6.13.0"},"devDependencies":{"tsx":"^4.16.0"} }
