@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.35;
 import {Test} from "forge-std/Test.sol";
-import {EverlastingPut} from "../src/EverlastingPut.sol";
+import {EverlastingMarket} from "../src/EverlastingMarket.sol";
 import {MockUSDC} from "../src/MockUSDC.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 
 contract PutFundingTest is Test {
-    EverlastingPut put; MockUSDC usdc; MockOracle oracle;
+    EverlastingMarket put; MockUSDC usdc; MockOracle oracle;
     function setUp() public {
         usdc = new MockUSDC(); oracle = new MockOracle();
-        put = new EverlastingPut(usdc, oracle, 48e18, address(this));
+        put = new EverlastingMarket(usdc, oracle, EverlastingMarket.Side.PUT, 48e18, 48e18, address(this));
         oracle.set(48e18);
     }
     function test_guard_markBelowIntrinsicReverts() public {
@@ -18,7 +18,7 @@ contract PutFundingTest is Test {
         put.postMark(5e18);
     }
     function test_guard_markAboveKReverts() public {
-        vm.expectRevert(bytes("mark>K"));
+        vm.expectRevert(bytes("mark>W"));
         put.postMark(49e18);
     }
     function test_guard_deviationReverts() public {

@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.35;
 import {Test} from "forge-std/Test.sol";
-import {EverlastingPut} from "../src/EverlastingPut.sol";
+import {EverlastingMarket} from "../src/EverlastingMarket.sol";
 import {MockUSDC} from "../src/MockUSDC.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 
 contract PutAutoSettleTest is Test {
-    EverlastingPut put; MockUSDC usdc; MockOracle oracle;
+    EverlastingMarket put; MockUSDC usdc; MockOracle oracle;
     address trader = address(0xA11CE);
     function setUp() public {
         usdc = new MockUSDC(); oracle = new MockOracle();
-        put = new EverlastingPut(usdc, oracle, 48e18, address(this));
+        put = new EverlastingMarket(usdc, oracle, EverlastingMarket.Side.PUT, 48e18, 48e18, address(this));
         oracle.set(48e18);
         usdc.mint(address(this), 1_000_000e6); usdc.approve(address(put), type(uint256).max);
         put.lpDeposit(500_000e6); put.postMark(6e18);
