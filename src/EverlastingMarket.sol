@@ -2,6 +2,7 @@
 pragma solidity 0.8.35;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
+import {IYieldAdapter} from "./interfaces/IYieldAdapter.sol";
 
 contract EverlastingMarket {
     enum Side { PUT, CALL }
@@ -17,6 +18,9 @@ contract EverlastingMarket {
     uint256 public protocolFeeBps;   // cut of funding carry, <= MAX_FEE_BPS
     uint256 public feeAccrued;       // USDC owed to protocol
     uint256 public constant MAX_FEE_BPS = 2000;
+    address public yieldAdapter;      // address(0) => float disabled (Slice-1 behavior)
+    uint256 public reserveBps = 2000; // keep >=20% of free capital liquid in-contract
+    uint256 public deployedToYield;   // principal currently at the adapter (USDC)
     uint256 public lastIntrinsic;        // intrinsic sampled at the last postMark (WAD)
 
     uint256 public poolFree;    // USDC available (in-contract)
@@ -51,6 +55,46 @@ contract EverlastingMarket {
         require(usdc.transfer(to, amt), "transfer");
     }
 
+    function setYieldAdapter(address a) external {
+        require(msg.sender == owner, "only owner");
+        require(deployedToYield == 0, "unwind first");   // switch only when nothing is out
+        yieldAdapter = a;
+    }
+    function setReserveBps(uint256 bps) external {
+        require(msg.sender == owner, "only owner");
+        require(bps <= 10_000, "bps");
+        reserveBps = bps;
+    }
+    // Push free capital above the reserve out to yield. Never touches poolLocked/traderCollateral.
+    function sweepToYield() external {
+        require(yieldAdapter != address(0), "no adapter");
+        uint256 reserve = poolFree * reserveBps / 10_000;
+        require(poolFree > reserve, "nothing to sweep");
+        uint256 amt = poolFree - reserve;
+        poolFree -= amt; deployedToYield += amt;
+        require(usdc.approve(yieldAdapter, amt), "approve");
+        IYieldAdapter(yieldAdapter).deposit(amt);
+    }
+    // Realize adapter gains (balance - principal) to the protocol fee bucket.
+    function harvest() external {
+        require(yieldAdapter != address(0), "no adapter");
+        uint256 bal = IYieldAdapter(yieldAdapter).balance();
+        if (bal > deployedToYield) {
+            uint256 gain = bal - deployedToYield;
+            IYieldAdapter(yieldAdapter).withdraw(gain);   // yield returns to contract
+            feeAccrued += gain;                            // 100% protocol (per spec default)
+        }
+    }
+    // Pull `need` USDC back from yield into poolFree if in-contract free is short.
+    function _ensureLiquidity(uint256 need) internal {
+        if (poolFree >= need || yieldAdapter == address(0)) return;
+        uint256 pull = need - poolFree;
+        if (pull > deployedToYield) pull = deployedToYield;
+        if (pull == 0) return;
+        deployedToYield -= pull; poolFree += pull;
+        IYieldAdapter(yieldAdapter).withdraw(pull);
+    }
+
     function intrinsicWad() public view returns (uint256) {
         uint256 s = oracle.spotWad();
         if (side == Side.PUT) {
@@ -71,7 +115,9 @@ contract EverlastingMarket {
     }
     function lpWithdraw(uint256 amt) external {
         require(msg.sender == lp, "only LP");                 // AUDIT F1
-        require(amt <= poolFree, "pool: insufficient free");
+        require(amt <= poolFree + deployedToYield, "pool: insufficient free");
+        _ensureLiquidity(amt);
+        require(amt <= poolFree, "pool: illiquid");
         poolFree -= amt;
         require(usdc.transfer(msg.sender, amt), "transfer");
     }
@@ -96,6 +142,7 @@ contract EverlastingMarket {
         require(positions[msg.sender].qty == 0, "one position");
         uint256 im = _escrowUsdc(qtyWad);                 // IM = qty*W
         require(traderCollateral[msg.sender] >= im, "open: IM");
+        _ensureLiquidity(im);
         require(poolFree >= im, "open: pool escrow");
         poolFree -= im; poolLocked += im;
         positions[msg.sender] = Position(qtyWad, mark, cumFunding);
