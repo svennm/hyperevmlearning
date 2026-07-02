@@ -76,6 +76,38 @@ contract EverlastingPut {
         positions[msg.sender] = Position(qtyWad, mark, cumFunding);
     }
 
-    // temporary in Task 6; replaced by guarded keeper entrypoint in Task 7
-    function postMark(uint256 newMark) external { mark = newMark; lastMarkTime = block.timestamp; }
+    event MarkPosted(uint256 mark, uint256 cumFunding);
+
+    function postMark(uint256 newMark) external {
+        require(msg.sender == keeper, "only keeper");
+        uint256 intrinsic = intrinsicWad();
+        require(newMark >= intrinsic, "mark<intrinsic");   // always-on bounds
+        require(newMark <= K, "mark>K");
+        if (mark != 0) {
+            uint256 age = block.timestamp - lastMarkTime;
+            if (age <= MAX_MARK_AGE) {
+                // FRESH: enforce deviation + accrue funding for elapsed periods.
+                uint256 hi = mark + mark * MAX_MARK_DEV_BPS / 10_000;
+                uint256 lo = mark - mark * MAX_MARK_DEV_BPS / 10_000;
+                require(newMark <= hi && newMark >= lo, "mark deviation");
+                uint256 periods = age / FUNDING_PERIOD;
+                if (periods > 0) {
+                    // AUDIT F3: contemporaneous start-of-period pair (mark & lastIntrinsic both from prior post)
+                    uint256 f = mark >= lastIntrinsic ? mark - lastIntrinsic : 0; // time value per unit
+                    cumFunding += f * periods;
+                }
+            }
+            // else: STALE gap (> MAX_MARK_AGE) -> recoverable re-seed; skip deviation + funding (AUDIT F5)
+        }
+        mark = newMark;
+        lastMarkTime = block.timestamp;
+        lastIntrinsic = intrinsic;                          // sample intrinsic with the mark
+        emit MarkPosted(newMark, cumFunding);
+    }
+
+    function pendingFunding(address t) public view returns (uint256) {
+        Position memory p = positions[t];
+        if (p.qty == 0) return 0;
+        return p.qty * (cumFunding - p.entryCumFunding) / 1e18; // WAD
+    }
 }
