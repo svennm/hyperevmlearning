@@ -113,6 +113,14 @@ contract EverlastingPut {
 
     event Closed(address indexed trader, int256 pnlUsdc);
 
+    function settle(address t) external {
+        Position memory p = positions[t];
+        require(p.qty > 0, "no position");
+        uint256 fundingU = _toUsdc(pendingFunding(t));
+        require(fundingU > traderCollateral[t], "solvent");
+        _closeFor(t); // _closeFor already floors trader loss at their collateral
+    }
+
     function close() external { _closeFor(msg.sender); }
 
     function _closeFor(address t) internal {
