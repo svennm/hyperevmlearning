@@ -11,6 +11,9 @@ contract EverlastingPut {
     address public keeper;
     uint256 public lastIntrinsic;        // intrinsic sampled at the last postMark (WAD)
 
+    uint256 public poolFree;    // USDC available
+    uint256 public poolLocked;  // USDC escrowed vs open positions
+
     uint256 public constant FUNDING_PERIOD = 3600;
     uint256 public constant MAX_MARK_AGE = 7200;
     uint256 public constant MAX_MARK_DEV_BPS = 2000;
@@ -25,4 +28,17 @@ contract EverlastingPut {
     }
 
     function _toUsdc(uint256 wad) internal pure returns (uint256) { return wad / 1e12; }
+
+    function lpDeposit(uint256 amt) external {
+        require(msg.sender == lp, "only LP");
+        require(usdc.transferFrom(msg.sender, address(this), amt), "transfer");
+        poolFree += amt;
+    }
+
+    function lpWithdraw(uint256 amt) external {
+        require(msg.sender == lp, "only LP");                 // AUDIT F1: gate pool withdrawals
+        require(amt <= poolFree, "pool: insufficient free");
+        poolFree -= amt;
+        require(usdc.transfer(msg.sender, amt), "transfer");
+    }
 }
