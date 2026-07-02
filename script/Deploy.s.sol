@@ -12,8 +12,11 @@ contract Deploy is Script {
         vm.startBroadcast(pk);
         MockUSDC usdc = new MockUSDC();
         OracleLib oracle = new OracleLib();
-        uint256 spot = oracle.spotWad();
-        uint256 K = (spot / 1e18) * 1e18;         // ATM-ish, whole-dollar strike
+        // K from env (whole-dollar ATM wad, computed off-chain). Calling oracle.spotWad()
+        // here reverts under `forge script` simulation: the HyperCore precompile 0x…0807
+        // has no bytecode in forge's local sim. Compute K off-chain and pass via STRIKE_K.
+        // See docs/RUNBOOK.md.
+        uint256 K = vm.envUint("STRIKE_K");
         EverlastingPut put = new EverlastingPut(usdc, oracle, K, keeper);
         vm.stopBroadcast();
         console2.log("MockUSDC", address(usdc));

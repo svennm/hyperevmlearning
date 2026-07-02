@@ -1,6 +1,6 @@
 # Everlasting options on HIP-3 (Trade.xyz) markets — feasibility findings
 
-**Date:** 2026-07-02 · **Verdict:** READ path **GREEN (empirically verified on mainnet)**; WRITE/hedge path is the remaining go/no-go.
+**Date:** 2026-07-02 · **Verdict:** 🟢 **GREEN — both legs empirically verified.** READ verified on mainnet (`oraclePx` matched the API across 6 `xyz:` markets); WRITE verified on testnet 2026-07-02 — a HyperEVM **contract** opened a *filled* position on a HIP-3 market (`felix:TEST1`, szi 0.5, entryPx 43.31) via **CoreWriter**. The only remaining exposures are the operational/counterparty risks below (deployer oracle + halt), not technical feasibility.
 
 Assessing building everlasting (perpetual, funding-based) options on HyperEVM that use Trade.xyz's
 HIP-3 real-world-asset perps as the underlying reference + delta-hedge venue.
@@ -40,11 +40,14 @@ Native controls (`oraclePx(0)=BTC`, `(1)=ETH`, `(3)=MATIC`) return sane prices, 
 is live; only the mis-encoded HIP-3 ids revert. → **the option pricer + funding engine can consume the
 HIP-3 oracle on-chain, trustlessly** (modulo the deployer-run oracle, below).
 
-## WRITE / hedge path — NOT yet verified ⏳ (the remaining go/no-go)
+## WRITE / hedge path — VERIFIED ✅ (testnet, 2026-07-02)
 CoreWriter (`0x333…3333`, `sendRawAction`; Limit action id **1**, `reduceOnly` to close) is the hedging
-primitive. The action `asset` field uses the **100000+** id (110003 for GOLD). Placing an order is a
-state change requiring a funded HyperCore account → **cannot be confirmed read-only.** Test: one small
-IOC on `xyz:GOLD` via CoreWriter, then read the position back via the `0x…0800` precompile on a later block.
+primitive; the action `asset` field uses the **100000+** id (`100000 + dex*10000 + market`). **Confirmed
+on testnet:** a deployed HyperEVM **contract** funded a HyperCore account and sent a marketable IOC via
+CoreWriter that **filled** — position `szi=0.5 felix:TEST1, entryPx=43.31, ~$20`, order status *filled*.
+So a contract can open/close (hence delta-hedge) a HIP-3 builder market via CoreWriter. Caveats
+(documented, not blockers): writes are fire-and-forget + delayed a few seconds; HIP-3 is isolated-margin
+only; fees ≈ 2× native perps.
 
 ## Risks to design around
 - **Deployer-run centralized oracle** (Trade.xyz "Relayer", ~3s cadence, **clamped ≤1% per update** →
