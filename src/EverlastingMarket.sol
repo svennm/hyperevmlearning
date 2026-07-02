@@ -40,7 +40,9 @@ contract EverlastingMarket {
             uint256 v = s >= K ? 0 : K - s;
             return v > W ? W : v;                 // clamp to max payout (no-op when W==K)
         }
-        revert("call: todo");                     // CALL branch implemented in Task 2
+        // CALL: clamp(S - K, 0, W)
+        uint256 v = s <= K ? 0 : s - K;
+        return v > W ? W : v;
     }
 
     function _toUsdc(uint256 wad) internal pure returns (uint256) { return wad / 1e12; }
