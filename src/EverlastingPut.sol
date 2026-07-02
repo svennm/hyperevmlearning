@@ -110,4 +110,41 @@ contract EverlastingPut {
         if (p.qty == 0) return 0;
         return p.qty * (cumFunding - p.entryCumFunding) / 1e18; // WAD
     }
+
+    event Closed(address indexed trader, int256 pnlUsdc);
+
+    function close() external { _closeFor(msg.sender); }
+
+    function _closeFor(address t) internal {
+        Position memory p = positions[t];
+        require(p.qty > 0, "no position");
+        uint256 fundingWad = p.qty * (cumFunding - p.entryCumFunding) / 1e18; // owed to pool
+        int256 markPnlWad = int256(p.qty) * (int256(mark) - int256(p.entryMark)) / 1e18;
+
+        uint256 fundingU = _toUsdc(fundingWad);
+        int256 markPnlU = markPnlWad >= 0 ? int256(_toUsdc(uint256(markPnlWad)))
+                                          : -int256(_toUsdc(uint256(-markPnlWad)));
+        int256 netU = markPnlU - int256(fundingU); // trader delta
+
+        // AUDIT F2: release THIS position's escrow FIRST so poolFree >= escrow >= max gain
+        // (g <= qty*(mark-entryMark) <= qty*K = escrow), so the payout require can never false-revert.
+        uint256 escrow = _escrowUsdc(p.qty);
+        poolLocked -= escrow; poolFree += escrow;
+
+        // apply PnL to balances; pool is the counterparty
+        uint256 col = traderCollateral[t];
+        if (netU >= 0) {
+            uint256 g = uint256(netU);
+            require(poolFree >= g, "pool insolvent"); // now always holds by construction
+            poolFree -= g; col += g;
+        } else {
+            uint256 l = uint256(-netU);
+            if (l > col) l = col;                     // auto-settle floor: never below 0
+            col -= l; poolFree += l;
+        }
+
+        traderCollateral[t] = col;
+        delete positions[t];
+        emit Closed(t, netU);
+    }
 }
