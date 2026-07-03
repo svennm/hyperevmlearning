@@ -61,7 +61,32 @@ HYPE drawdown liquidates the cover and leaves the pool short a naked uncapped ca
 a non-liquidatable cover and CoreWriter can't set leverage, **Option A (spot HYPE cover)** is now the
 clean path. Option B is viable if funding income / capital efficiency is worth an off-chain agent.
 
+## Spot-cover spike (CHOSEN path) — VERIFIED live
+
+`src/spike/SpotCoverSpike.sol`, deployed `0x791A754f244aCA594104dba53605A5C1b18da6C2`. Ran the full
+round trip on testnet 998 with 100 USDC:
+
+1. **buyCover** — bought 1.00 HYPE spot @ $63 on asset `11035` (fee 0.0007 HYPE). USDC 100 → 37,
+   HYPE 0 → 0.9993. The cover is just a **held token balance** — no leverage, no liqPx, no keeper.
+2. **sellCover** — first attempt to sell the raw 0.9993 balance was **silently rejected**: HYPE
+   `szDecimals = 2`, so order size must be a 0.01 increment, and 0.9993 (fee dust) is invalid.
+   Selling **0.99** (`99000000`) filled @ $50. USDC 37 → 86.47, leaving 0.0093 HYPE dust.
+3. **Swept** 86.47 USDC + 0.0093 HYPE back to the funder; contract empty.
+
+Round-trip lost ~$13 = the **testnet** $63 ask / $50 bid spread (+ $0.035 fee). Mainnet HYPE/USDC is
+liquid; not representative.
+
+**New finding → 3b requirement:** when unwinding the cover, the sell size MUST be floored to the
+underlying's `szDecimals` (HYPE: 2 dp); fee/rounding leaves un-sellable dust that the contract has to
+tolerate in its cover accounting (don't assume you can sell the exact held balance).
+
+**Verdict:** spot cover works end-to-end and is trustless/non-liquidatable. Green light to build
+`CoveredCallMarket3b` on it.
+
 ## Reusable facts for the real contract
 - Order px/sz = `human * 1e8`; marketable = IOC through the book; poll reads one Core block after a write.
-- Fresh contract Core accounts default to classic (disabled) + isolated max leverage; `setAbstraction(self,2)` → unified.
-- PnL on close realizes to the account's spot USDC balance.
+- Perp read px = `price * 10^(6-szDecimals)` (HYPE `*1e4`); spot read px (`spotPx`) = `*1e6` — neither equals the `*1e8` order scale.
+- Order size must respect the asset `szDecimals` (HYPE = 2 → 0.01 increments); floor + carry dust.
+- Fresh contract Core accounts default to classic (disabled) + isolated max leverage; `setAbstraction(self,2)` → unified. (Spot cover needs none of this — plain spot balances.)
+- Buy/sell settle into the account's spot USDC/HYPE balances; `spotSend` moves them out (rescue / payout).
+- HYPE/USDC spot pair index 1035 → order asset id 11035; HYPE token 1105 (weiDec 8); USDC token 0.
