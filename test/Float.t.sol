@@ -26,9 +26,10 @@ contract FloatTest is Test {
     }
     function test_floatNeverTouchesLockedOrTrader() public {
         vm.startPrank(trader); p.deposit(48e6); p.openLong(1e18); vm.stopPrank();  // locks $48 escrow
+        p.setReserveBps(0);
         p.sweepToYield();
         // locked escrow + trader collateral remain fully in-contract:
-        assertGe(usdc.balanceOf(address(p)), p.poolLocked() + p.traderCollateral(trader));
+        assertEq(usdc.balanceOf(address(p)), p.poolLocked() + p.traderCollateral(trader));
     }
     function test_harvest_routesYieldToFee() public {
         p.sweepToYield();
