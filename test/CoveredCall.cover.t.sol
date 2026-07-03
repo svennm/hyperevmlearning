@@ -47,6 +47,15 @@ contract CoveredCallCoverTest is Test {
         assertEq(market.coverEntry(), 75e18);
     }
 
+    function test_increaseCover_weightedAvg_unequalQty() public {
+        oracle.set(50e18);
+        market.increaseCover(3e18);
+        oracle.set(100e18);
+        market.increaseCover(1e18);
+        assertEq(market.coverQty(), 4e18);
+        assertEq(market.coverEntry(), 62_500000000000000000);
+    }
+
     function test_coverEquityUsdc() public {
         oracle.set(50e18);
         market.increaseCover(2e18);
