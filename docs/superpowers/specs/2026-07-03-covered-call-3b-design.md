@@ -113,8 +113,22 @@ funding, close math) is **EVM** state. USDC can sit in either place:
 5. (If F1) fold put side into the same contract + shared pool; (if D2=a) Core-spot USDC deposit/withdraw path.
 6. Fork tests against live testnet; then a real 2-sided testnet deployment + smoke.
 
-## Open decisions for the user
-- **D1:** F1 unified two-sided book, or F2 standalone covered-call market first?
-- **D2:** Collateral in Core-spot USDC (a) or EVM ERC20 (b)?
-- **D3:** Confirm the pre-funded-cover model (keeper tops up ahead of demand; writes gate on settled cover).
-- **Netting expectation:** acknowledge fold = capital efficiency now, inventory-netting only if/when we add put-book delta-hedging (not a cover-size discount).
+## Resolved decisions (2026-07-03)
+- **D1 → F1:** one **unified two-sided `EverlastingBook`** (PUT + COVERED_CALL) sharing `poolUsdc`,
+  HYPE cover inventory, keeper/funding/oracle, and a single solvency invariant with hard per-side caps.
+- **D2 → Core-spot USDC:** collateral and cover both live on the contract's HyperCore account; no
+  bridge hop on the `close()` payout path. Trader deposit/withdraw are Core-side ops (design the UX in
+  the build plan — likely EVM entrypoints that drive CoreWriter `spotSend`/bridge, or direct Core deposits).
+- **D3 → pre-funded cover:** keeper maintains HYPE cover ≥ open call notional ahead of demand;
+  `openLong` gates on the on-chain `spotBalance` cover read (not optimistic local state).
+- **Netting expectation (acknowledged):** fold = capital efficiency + a single solvency model now;
+  inventory-netting only if/when we later delta-hedge the put book with short HYPE. 1:1 tail cover is
+  never discounted by the put book.
+
+## Consequence of D1+D2 (scope note)
+This is a meaningful shift from 3a (EVM `MockUSDC`, call-only): collateral moves onto **HyperCore**
+(Core-spot USDC + HYPE cover), with the EVM contract as controller (reads via precompiles, acts via
+CoreWriter), spanning **both** put and covered-call sides. The 3a `CoveredCallMarket` accounting
+(cover ledger, funding, net-loss close predicate from I2, conservation invariant from I1) is reused,
+but the collateral/settlement layer is rebuilt on Core. Next artifact: a task-by-task **build plan**
+for SDD.
