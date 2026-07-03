@@ -66,4 +66,24 @@ contract CoveredCallMarket {
         traderCollateral[msg.sender] -= amt;
         require(usdc.transfer(msg.sender, amt), "transfer");
     }
+
+    function increaseCover(uint256 qtyWad) external {
+        require(msg.sender == lp || msg.sender == keeper, "only lp/keeper");
+        uint256 s = oracle.spotWad();
+        if (coverQty == 0) {
+            coverEntry = s;
+        } else {
+            coverEntry = (coverQty * coverEntry + qtyWad * s) / (coverQty + qtyWad);
+        }
+        coverQty += qtyWad;
+    }
+
+    function coverEquityUsdc() public view returns (uint256) {
+        uint256 s = oracle.spotWad();
+        return _toUsdc(coverQty * s / 1e18);
+    }
+
+    function _coverCovers(uint256 addQty) internal view returns (bool) {
+        return coverQty >= netWritten + addQty;
+    }
 }
