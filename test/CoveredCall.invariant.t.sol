@@ -111,25 +111,25 @@ contract CoveredCallInvariantTest is Test {
         targetContract(address(h));
     }
 
-    function invariant_solvencyGivenCover() public view {
-        uint256 cq = market.coverQty();
-        uint256 nw = market.netWritten();
-
-        // Only assert when cover premise holds
-        if (cq < nw) return;
-
-        uint256 intrinsic = market.intrinsicWad();
-        uint256 owed = 0;
+    // Value conservation: the contract's real USDC balance equals its internal accounting
+    // (pool + every trader's collateral). This is the load-bearing 3a solvency invariant — it
+    // fails on ANY arithmetic leak in close()/settle()/deposit/withdraw's fund movements, and
+    // unlike the old intrinsic-vs-cover check it actually exercises poolUsdc. No fees/float in 3a,
+    // so those terms are absent.
+    function invariant_conservation() public view {
+        uint256 acct = market.poolUsdc();
         for (uint256 i = 0; i < actors.length; i++) {
-            (uint256 qty,,) = market.positions(actors[i]);
-            if (qty > 0) {
-                // _toUsdc(qty * intrinsic / 1e18) = qty * intrinsic / 1e18 / 1e12
-                owed += qty * intrinsic / 1e18 / 1e12;
-            }
+            acct += market.traderCollateral(actors[i]);
         }
+        assertEq(usdc.balanceOf(address(market)), acct, "conservation: balance != pool + collateral");
+    }
 
-        assertGe(market.poolUsdc() + market.coverEquityUsdc(), owed,
-            "solvency: poolUsdc+coverEquity < owed");
+    // Cover-gate: the contract must always keep enough HYPE cover to back every open short call.
+    // (This is the relationship the old "solvencyGivenCover" assertion actually proved — stated
+    // honestly here. It does NOT establish that poolUsdc can fund close() payouts; realizing the
+    // cover into USDC on close is 3b.)
+    function invariant_coverGate() public view {
+        assertGe(market.coverQty(), market.netWritten(), "coverGate: coverQty < netWritten");
     }
 
     // Non-vacuity: real marks and real opens must have landed
