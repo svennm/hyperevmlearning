@@ -14,6 +14,8 @@
 - **RPC:** `https://rpc.hyperliquid-testnet.xyz/evm`
 
 ## Deploying
+> **Status:** The two-market deploy script below is ready but **has not yet been executed on testnet**. Only the Slice-1 single `EverlastingPut` (`0xD48a…C135`, see table above) has been deployed and smoked. The commands here document the intended Slice-2 procedure for when the deploy is run.
+
 > ⚠️ `script/Deploy.s.sol` computes `K` and `K_HI` from env vars (not by calling `oracle.spotWad()` in-script). `forge script` runs a local simulation first, and the HyperCore precompile `0x…0807` has no bytecode in that sim → `call to non-contract address` revert. Pass `K` and `K_HI` via `STRIKE_K` and `STRIKE_K_HI` (computed off-chain).
 
 **Environment variables** (required in `.env` or exported):
@@ -40,7 +42,7 @@ The script logs:
 - PUT and CALL market addresses
 - K (wad), K_HI (wad), protocol fee (bps)
 
-## Smoke (verified working end-to-end 2026-07-02)
+## Smoke — Slice-1 `EverlastingPut` only (verified 2026-07-02)
 All `cast send ... --private-key $DEPLOYER_PRIVATE_KEY --rpc-url $RPC`, `M`=market, `U`=MockUSDC, `A`=deployer:
 ```bash
 cast send $U 'mint(address,uint256)' $A 1000000000000      # 1M mUSDC
