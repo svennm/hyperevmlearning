@@ -4,10 +4,7 @@ An on-chain **everlasting options** venue on Hyperliquid's HyperEVM testnet, imp
 perpetual (funding-based, never-expiring) options design of White & Bankman-Fried
 ([Paradigm, 2021](https://www.paradigm.xyz/writing/everlasting-options)).
 
-**Slice 1 (in progress):** a peer-to-pool **everlasting HYPE put** — traders go long, an LP pool
-writes, and funding `= mark − intrinsic` settles hourly off the live HYPE oracle. A put's payoff is
-bounded by the strike, so the pool is fully collateralized with no hedge and no liquidation engine
-(solvency is proven; edge cases resolve via penalty-free auto-settle).
+**Slice 2 (complete):** an everlasting PUT plus a capped everlasting CALL (call spread, payoff bounded at W=K_hi-K), a protocol fee (funding-carry cut), and opt-in yield-adapter float are all shipped and tested. The put hedges long HYPE (spot or perp long) below K; the capped call hedges short HYPE up to K_hi.
 
 ## Status
 | Task | What | State |
@@ -15,7 +12,7 @@ bounded by the strike, so the pool is fully collateralized with no hedge and no 
 | 1 | Foundry config + remappings | ✅ |
 | 2 | MockUSDC (6-dp collateral) | ✅ |
 | 3 | OracleLib — HYPE oracle read (WAD) + live fork test | ✅ |
-| 4–12 | intrinsic · LP pool · open · funding+guards · close · auto-settle · solvency invariant · keeper+deploy · testnet smoke | ⏳ |
+| 4–12 | intrinsic · LP pool · open · funding+guards · close · auto-settle · solvency invariant · keeper+deploy · testnet smoke | ✅ |
 
 Built task-by-task with TDD; the implementation plan was hardened by a 45-agent adversarial audit
 (16 findings, 4 blockers fixed) before any code was written. See `docs/superpowers/`.
