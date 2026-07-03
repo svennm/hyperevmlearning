@@ -14,19 +14,31 @@
 - **RPC:** `https://rpc.hyperliquid-testnet.xyz/evm`
 
 ## Deploying
-> ⚠️ `script/Deploy.s.sol` originally derived `K` by calling `oracle.spotWad()` **inside the script**. `forge script` runs a local simulation first, and the HyperCore precompile `0x…0807` has no bytecode in that sim → `call to non-contract address` revert. The script now takes `K` from `STRIKE_K` (env) instead, so simulation no longer touches the precompile.
+> ⚠️ `script/Deploy.s.sol` computes `K` and `K_HI` from env vars (not by calling `oracle.spotWad()` in-script). `forge script` runs a local simulation first, and the HyperCore precompile `0x…0807` has no bytecode in that sim → `call to non-contract address` revert. Pass `K` and `K_HI` via `STRIKE_K` and `STRIKE_K_HI` (computed off-chain).
 
-Reproducible deploy (either works):
+**Environment variables** (required in `.env` or exported):
+- `DEPLOYER_PRIVATE_KEY` — deployer account key
+- `KEEPER_PRIVATE_KEY` — keeper account key (oracle heartbeat driver)
+- `STRIKE_K` — put strike, wad (whole-dollar ATM, e.g., `47e18` for $47)
+- `STRIKE_K_HI` — call upper strike, wad (e.g., `50e18` for $50); capped call width is `K_HI - K`
+- `PROTOCOL_FEE_BPS` — protocol fee in basis points (e.g., `500` = 5%)
+
+The script deploys **two markets**:
+1. **PUT**: `Side.PUT`, width = `K` (ATM)
+2. **CALL**: `Side.CALL`, width = `K_HI - K` (capped)
+
+Both markets have the same protocol fee set via `setProtocolFeeBps()`.
+
+Reproducible deploy:
 ```bash
-set -a; source .env; set +a          # RPC, DEPLOYER_PRIVATE_KEY, KEEPER_PRIVATE_KEY, STRIKE_K
+set -a; source .env; set +a
 forge script script/Deploy.s.sol --rpc-url "$HYPEREVM_TESTNET_RPC" --broadcast
 ```
-Or `forge create` directly (compute K off-chain; **`--constructor-args` must come LAST** — it is variadic and will otherwise eat `--rpc-url`/`--private-key`):
-```bash
-forge create src/EverlastingPut.sol:EverlastingPut \
-  --private-key "$DEPLOYER_PRIVATE_KEY" --rpc-url "$RPC" --broadcast \
-  --constructor-args <MockUSDC> <OracleLib> <K_wad> <keeper>
-```
+
+The script logs:
+- MockUSDC, OracleLib addresses
+- PUT and CALL market addresses
+- K (wad), K_HI (wad), protocol fee (bps)
 
 ## Smoke (verified working end-to-end 2026-07-02)
 All `cast send ... --private-key $DEPLOYER_PRIVATE_KEY --rpc-url $RPC`, `M`=market, `U`=MockUSDC, `A`=deployer:
