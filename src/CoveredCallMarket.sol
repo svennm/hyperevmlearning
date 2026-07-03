@@ -29,6 +29,7 @@ contract CoveredCallMarket {
     mapping(address => Position) public positions;
 
     event MarkPosted(uint256 mark, uint256 cumFunding);
+    event Closed(address indexed trader, int256 net);
 
     constructor(IERC20 _usdc, ISpotOracle _oracle, uint256 _K, address _keeper) {
         require(_K > 0, "K=0");
@@ -74,6 +75,7 @@ contract CoveredCallMarket {
     }
 
     function increaseCover(uint256 qtyWad) external {
+        require(qtyWad > 0, "qty=0");
         require(msg.sender == lp || msg.sender == keeper, "only lp/keeper");
         uint256 s = oracle.spotWad();
         if (coverQty == 0) {
@@ -94,6 +96,7 @@ contract CoveredCallMarket {
     }
 
     function openLong(uint256 qtyWad) external {
+        require(qtyWad > 0, "qty=0");
         require(mark > 0, "no mark");
         require(block.timestamp <= lastMarkTime + MAX_MARK_AGE, "stale mark");
         require(positions[msg.sender].qty == 0, "one position");
@@ -133,5 +136,62 @@ contract CoveredCallMarket {
         lastMarkTime = block.timestamp;
         lastIntrinsic = intrinsic;
         emit MarkPosted(newMark, cumFunding);
+    }
+
+    // ── Task 4: close / cash-settle / reduceCover ────────────────────────────
+
+    function _closeFor(address t) internal {
+        Position memory p = positions[t];
+        require(p.qty > 0, "no position");
+
+        uint256 fundingWad = p.qty * (cumFunding - p.entryCumFunding) / 1e18;
+        uint256 fundingU   = _toUsdc(fundingWad);
+
+        // Mark PnL split into gain / loss to avoid int256 intermediate arithmetic
+        // (keeps all arithmetic in uint256, only casts at emit boundary)
+        uint256 markGainU;
+        uint256 markLossU;
+        if (mark >= p.entryMark) {
+            markGainU = _toUsdc(p.qty * (mark - p.entryMark) / 1e18);
+        } else {
+            markLossU = _toUsdc(p.qty * (p.entryMark - mark) / 1e18);
+        }
+
+        // netU = markGain − markLoss − funding (trader perspective, USDC)
+        if (markGainU >= markLossU + fundingU) {
+            uint256 g = markGainU - markLossU - fundingU;
+            require(poolUsdc >= g, "pool");
+            poolUsdc -= g;
+            traderCollateral[t] += g;
+            netWritten -= p.qty;
+            delete positions[t];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            emit Closed(t, int256(g));
+        } else {
+            uint256 l = markLossU + fundingU - markGainU;
+            if (l > traderCollateral[t]) l = traderCollateral[t]; // auto-settle floor
+            traderCollateral[t] -= l;
+            poolUsdc += l;
+            netWritten -= p.qty;
+            delete positions[t];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            emit Closed(t, -int256(l));
+        }
+    }
+
+    function close() external {
+        _closeFor(msg.sender);
+    }
+
+    function settle(address t) external {
+        require(_toUsdc(pendingFunding(t)) > traderCollateral[t], "solvent");
+        _closeFor(t);
+    }
+
+    function reduceCover(uint256 qtyWad) external {
+        require(msg.sender == lp || msg.sender == keeper, "only lp/keeper");
+        require(qtyWad > 0, "qty=0");
+        require(coverQty - qtyWad >= netWritten, "cover<net");
+        coverQty -= qtyWad;
     }
 }

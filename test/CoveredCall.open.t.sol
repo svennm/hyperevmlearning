@@ -164,6 +164,33 @@ contract CoveredCallOpenTest is Test {
         assertEq(market.mark(), 62e18);
     }
 
+    // CARRY-IN T4: 2nd trader openLong reverts "cover" when coverQty == netWritten
+    function test_openLong_secondTraderRevertsNoCover() public {
+        // Set up exactly 1 unit of cover and let alice open 1 unit → coverQty == netWritten
+        market.increaseCover(1e18); // total cover = 1e18 (no prior cover in this test)
+
+        vm.warp(1);
+        vm.prank(keeper);
+        market.postMark(5e18);
+
+        vm.prank(alice);
+        market.deposit(5e6);
+        vm.prank(alice);
+        market.openLong(1e18); // netWritten = 1e18 = coverQty → cover fully consumed
+
+        address bob = address(0xB0B);
+        usdc.mint(bob, 10000e6);
+        vm.prank(bob);
+        usdc.approve(address(market), type(uint256).max);
+        vm.prank(bob);
+        market.deposit(5e6);
+
+        // No remaining cover (coverQty=1e18 == netWritten=1e18) → any qty reverts
+        vm.prank(bob);
+        vm.expectRevert("cover");
+        market.openLong(1e18);
+    }
+
     // CARRY-IN: test _coverCovers with netWritten > 0 boundary
     function test_coverCovers_netWrittenBoundary() public {
         CoveredCallOpenHarness harness = new CoveredCallOpenHarness(
