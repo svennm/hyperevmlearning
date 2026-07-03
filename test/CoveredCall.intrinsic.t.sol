@@ -72,12 +72,23 @@ contract CallCoveredIntrinsicTest is Test {
     }
 
     function test_withdraw_revertsWithOpenPosition() public {
+        // Real openLong flow (replaces brittle vm.store slot hack)
+        // LP (address(this)) provides cover and sets a valid mark via keeper
+        market.increaseCover(2e18);           // lp covers 2 units
+
+        oracle.set(50e18);                    // spot=50e18, intrinsic=2e18 (K=48e18)
+        vm.warp(1);
+        market.postMark(5e18);               // keeper == address(this) in this test suite
+
+        // alice deposits IM: qty=1e18, mark=5e18 -> IM = _toUsdc(1e18*5e18/1e18) = 5e6
         vm.prank(alice);
-        market.deposit(100e6);
+        market.deposit(5e6);
 
-        bytes32 slot = keccak256(abi.encode(alice, 10));
-        vm.store(address(market), slot, bytes32(uint256(1e18)));
+        // alice opens a real long position
+        vm.prank(alice);
+        market.openLong(1e18);
 
+        // withdraw must revert while position is open
         vm.prank(alice);
         vm.expectRevert("close first");
         market.withdraw(1);

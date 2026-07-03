@@ -20,9 +20,15 @@ contract CoveredCallMarket {
     uint256 public cumFunding;    // WAD funding per unit qty
     uint256 public lastIntrinsic; // WAD sampled at last postMark
 
+    uint256 public constant FUNDING_PERIOD  = 3600;   // seconds (1 hour)
+    uint256 public constant MAX_MARK_AGE    = 7200;   // seconds (2 hours)
+    uint256 public constant MAX_MARK_DEV_BPS = 2000;  // 20% max deviation per update
+
     struct Position { uint256 qty; uint256 entryMark; uint256 entryCumFunding; }
     mapping(address => uint256) public traderCollateral;
     mapping(address => Position) public positions;
+
+    event MarkPosted(uint256 mark, uint256 cumFunding);
 
     constructor(IERC20 _usdc, ISpotOracle _oracle, uint256 _K, address _keeper) {
         require(_K > 0, "K=0");
@@ -85,5 +91,47 @@ contract CoveredCallMarket {
 
     function _coverCovers(uint256 addQty) internal view returns (bool) {
         return coverQty >= netWritten + addQty;
+    }
+
+    function openLong(uint256 qtyWad) external {
+        require(mark > 0, "no mark");
+        require(block.timestamp <= lastMarkTime + MAX_MARK_AGE, "stale mark");
+        require(positions[msg.sender].qty == 0, "one position");
+        require(traderCollateral[msg.sender] >= _toUsdc(qtyWad * mark / 1e18), "IM");
+        require(_coverCovers(qtyWad), "cover");
+        netWritten += qtyWad;
+        positions[msg.sender] = Position(qtyWad, mark, cumFunding);
+    }
+
+    function pendingFunding(address t) public view returns (uint256) {
+        Position memory p = positions[t];
+        if (p.qty == 0) return 0;
+        return p.qty * (cumFunding - p.entryCumFunding) / 1e18;
+    }
+
+    function postMark(uint256 newMark) external {
+        require(msg.sender == keeper, "only keeper");
+        uint256 intrinsic = intrinsicWad();
+        require(newMark >= intrinsic, "mark<intrinsic");
+
+        bool isFresh = (mark != 0) && (block.timestamp <= lastMarkTime + MAX_MARK_AGE);
+
+        if (isFresh) {
+            uint256 hi = mark + mark * MAX_MARK_DEV_BPS / 10_000;
+            uint256 lo = mark - mark * MAX_MARK_DEV_BPS / 10_000;
+            require(newMark <= hi && newMark >= lo, "mark deviation");
+
+            uint256 age = block.timestamp - lastMarkTime;
+            uint256 periods = age / FUNDING_PERIOD;
+            if (periods > 0) {
+                uint256 f = mark >= lastIntrinsic ? mark - lastIntrinsic : 0;
+                cumFunding += f * periods;
+            }
+        }
+
+        mark = newMark;
+        lastMarkTime = block.timestamp;
+        lastIntrinsic = intrinsic;
+        emit MarkPosted(newMark, cumFunding);
     }
 }
