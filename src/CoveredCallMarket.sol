@@ -112,6 +112,26 @@ contract CoveredCallMarket {
         return p.qty * (cumFunding - p.entryCumFunding) / 1e18;
     }
 
+    // Trader's net loss in USDC (0 if net gain) — mirrors _closeFor's loss branch exactly:
+    // netLoss = markLoss + funding − markGain. This is the pool's claim on the trader; when it
+    // exceeds collateral the position is insolvent and the auto-settle floor forces the pool to
+    // absorb the shortfall. Since IM here is premium-only (qty·mark, not qty·W), markLoss alone
+    // can consume collateral — a funding-only predicate would miss that and lock out the keeper.
+    function netLossUsdc(address t) public view returns (uint256) {
+        Position memory p = positions[t];
+        if (p.qty == 0) return 0;
+        uint256 fundingU = _toUsdc(p.qty * (cumFunding - p.entryCumFunding) / 1e18);
+        uint256 markGainU;
+        uint256 markLossU;
+        if (mark >= p.entryMark) {
+            markGainU = _toUsdc(p.qty * (mark - p.entryMark) / 1e18);
+        } else {
+            markLossU = _toUsdc(p.qty * (p.entryMark - mark) / 1e18);
+        }
+        uint256 debit = markLossU + fundingU;
+        return debit > markGainU ? debit - markGainU : 0;
+    }
+
     function postMark(uint256 newMark) external {
         require(msg.sender == keeper, "only keeper");
         uint256 intrinsic = intrinsicWad();
@@ -184,7 +204,8 @@ contract CoveredCallMarket {
     }
 
     function settle(address t) external {
-        require(_toUsdc(pendingFunding(t)) > traderCollateral[t], "solvent");
+        require(positions[t].qty > 0, "no position");
+        require(netLossUsdc(t) > traderCollateral[t], "solvent");
         _closeFor(t);
     }
 

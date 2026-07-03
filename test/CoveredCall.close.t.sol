@@ -129,6 +129,39 @@ contract CoveredCallCloseTest is Test {
         assertEq(q, 0);
     }
 
+    // settle() fires on markLoss-driven insolvency even when funding alone ≤ collateral.
+    // This is the case the old funding-only predicate missed (keeper lockout → pool eats shortfall).
+    function test_settle_catchesMarkLossInsolvency() public {
+        // Top alice to 6e6 so funding alone (5e6) stays strictly below collateral.
+        vm.prank(alice);
+        market.deposit(1e6);
+        assertEq(market.traderCollateral(alice), 6e6);
+
+        // period 1: mark 5e18 → 4e18 (−20%). f = oldMark5 − lastIntr2 = 3e18 → cumFunding = 3e18
+        vm.warp(3601);
+        vm.prank(keeper);
+        market.postMark(4e18);
+
+        // period 2: mark 4e18 → 3.2e18 (−20%). f = oldMark4 − lastIntr2 = 2e18 → cumFunding = 5e18
+        vm.warp(7201);
+        vm.prank(keeper);
+        market.postMark(32e17);
+
+        // funding = 1e18·5e18/1e18 = 5e18 → 5e6 ; markLoss = 1e18·(5−3.2)e18/1e18 = 1.8e18 → 1.8e6
+        // netLoss = 5e6 + 1.8e6 = 6.8e6 > collateral 6e6 → INSOLVENT,
+        // yet funding 5e6 ≤ 6e6 → the old funding-only predicate would have reverted "solvent".
+        assertEq(market.pendingFunding(alice) / 1e12, 5e6);
+        assertLe(market.pendingFunding(alice) / 1e12, market.traderCollateral(alice)); // old: no-fire
+        assertEq(market.netLossUsdc(alice), 6_800_000);
+        assertGt(market.netLossUsdc(alice), market.traderCollateral(alice));            // truly insolvent
+
+        // New predicate fires — permissionless force-close succeeds; pool recovers full collateral.
+        market.settle(alice);
+        (uint256 q,,) = market.positions(alice);
+        assertEq(q, 0);
+        assertEq(market.traderCollateral(alice), 0);
+    }
+
     // reduceCover reverts "cover<net" if it would drop coverQty below netWritten
     function test_reduceCover_revertsIfBreaksInvariant() public {
         // coverQty=5e18, netWritten=1e18
