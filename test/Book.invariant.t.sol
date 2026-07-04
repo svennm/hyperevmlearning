@@ -346,6 +346,13 @@ contract BookInvariantTest is Test {
         book.lpDeposit(500_000e6);            // poolFree = 500_000e6
         vault.buyCover(1_000e18, type(uint256).max); // coverHype = 1000e18 (cost 100_000e6 from free)
 
+        // T8: LP-gating — transfer book ownership to the handler so it can call lpDeposit/lpWithdraw.
+        // The setUp contract is currently owner (it deployed the book). After this 2-step transfer,
+        // the handler becomes owner and its lpDeposit/lpWithdraw calls in the fuzz campaign succeed.
+        book.transferOwnership(address(h));
+        vm.prank(address(h));
+        book.acceptOwnership();
+
         // Bake ONE real position + mark on EACH side into the baseline snapshot (non-vacuity floor).
         h.bootstrap();
 

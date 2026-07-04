@@ -27,8 +27,8 @@ contract EverlastingBook {
     /// @notice Spot price oracle (WAD).
     ISpotOracle public immutable oracle;
 
-    /// @notice Privileged address permitted to post marks.
-    address public immutable keeper;
+    /// @notice Privileged address permitted to post marks (mutable; settable by owner).
+    address public keeper;
 
     /// @notice PUT strike (WAD).
     uint256 public immutable Kput;
@@ -44,6 +44,17 @@ contract EverlastingBook {
 
     /// @notice Maximum aggregate notional outstanding on the COVERED_CALL side (WAD).
     uint256 public immutable callCapNotional;
+
+    // ── Roles & pause switch (T8) ─────────────────────────────────────────────
+
+    /// @notice Contract owner (single-LP pool operator). Set in constructor; transferable via 2-step.
+    address public owner;
+
+    /// @notice Pending owner during a 2-step transfer. Must call acceptOwnership() to promote.
+    address public pendingOwner;
+
+    /// @notice When true, openLong (both sides) reverts. Exit paths always remain open.
+    bool public paused;
 
     // ── Per-side state ────────────────────────────────────────────────────────
 
@@ -114,6 +125,14 @@ contract EverlastingBook {
     event LpDeposited(address indexed lp, uint256 amt);
     /// @notice Emitted when an LP withdraws pool-free USDC (lowers poolFree).
     event LpWithdrawn(address indexed lp, uint256 amt);
+    // ── T8 admin events ───────────────────────────────────────────────────────
+    event Paused(address indexed account);
+    event Unpaused(address indexed account);
+    event KeeperChanged(address indexed oldKeeper, address indexed newKeeper);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    /// @notice Emitted by emergencyUnwindCover; hypeWad is the tick-floored amount sold.
+    event EmergencyUnwind(uint256 hypeWad);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -134,6 +153,7 @@ contract EverlastingBook {
         require(_Wput  > 0, "Wput=0");
         require(_Kcall > 0, "Kcall=0");
 
+        owner            = msg.sender;
         vault            = _vault;
         oracle           = _oracle;
         keeper           = _keeper;
@@ -142,6 +162,72 @@ contract EverlastingBook {
         Kcall            = _Kcall;
         putCapNotional   = _putCapNotional;
         callCapNotional  = _callCapNotional;
+    }
+
+    // ── Modifiers (T8) ───────────────────────────────────────────────────────
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "only owner");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "paused");
+        _;
+    }
+
+    // ── Admin functions (T8) ─────────────────────────────────────────────────
+
+    /// @notice Update the keeper address (must be non-zero).
+    function setKeeper(address newKeeper) external onlyOwner {
+        require(newKeeper != address(0), "keeper=0");
+        emit KeeperChanged(keeper, newKeeper);
+        keeper = newKeeper;
+    }
+
+    /// @notice Initiate a 2-step ownership transfer. Does NOT change owner until acceptOwnership().
+    /// @dev OZ Ownable2Step semantics: no single-tx owner loss.
+    function transferOwnership(address newOwner) external onlyOwner {
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// @notice Complete the 2-step transfer. Callable only by pendingOwner.
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "not pending");
+        address oldOwner = owner;
+        owner        = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(oldOwner, owner);
+    }
+
+    /// @notice Pause new openLong on both sides. Exit paths (close/settle/withdraw/lpWithdraw/
+    ///         postMark/deposit) remain fully open — pause is a de-risk switch, never a fund trap.
+    function pause() external onlyOwner {
+        paused = true;
+        emit Paused(msg.sender);
+    }
+
+    /// @notice Re-enable openLong on both sides.
+    function unpause() external onlyOwner {
+        paused = false;
+        emit Unpaused(msg.sender);
+    }
+
+    /// @notice Emergency wind-down: sell the entire cover position into the pool.
+    /// @dev Owner-only; requires the market to be paused (no new opens possible).
+    ///      Respects szDecimals=2 tick floor: sub-tick dust remains in coverHype.
+    ///      After this call, any remaining open call positions can still be closed — their payouts
+    ///      will be sourced from poolFree() (replenished by the proceeds of this cover sale).
+    function emergencyUnwindCover() external onlyOwner {
+        require(paused, "not paused");
+        uint256 ch = vault.coverHype();
+        // forge-lint: disable-next-line(divide-before-multiply) -- intentional floor-to-tick
+        uint256 flooredCoverHype = (ch / 1e16) * 1e16;
+        if (flooredCoverHype > 0) {
+            vault.sellCover(flooredCoverHype);
+        }
+        emit EmergencyUnwind(flooredCoverHype);
     }
 
     // ── Pool view — delegates to vault; book holds no cash ────────────────────
@@ -203,7 +289,7 @@ contract EverlastingBook {
     ///      qty·Wput of its OWN free USDC as escrow (fully collateralized). Cap on open qty.
     ///      COVERED_CALL: fresh mark required, one position per (side, trader), premium IM check,
     ///      D3 cover gate reads vault.coverHype() on-chain (not optimistic local state), cap check.
-    function openLong(Side side, uint256 qty) external {
+    function openLong(Side side, uint256 qty) external whenNotPaused {
         if (side == Side.PUT) {
             // ── PUT branch (port of EverlastingMarket.openLong) ──────────────
             uint8 sp = uint8(Side.PUT);
@@ -512,7 +598,7 @@ contract EverlastingBook {
     /// @dev Physical USDC up, NO trader claim recorded — so poolFree() rises by `amt`. This is the
     ///      capital that backs put escrow and replenishes winning-call payouts. Conservation holds:
     ///      poolUsdc rises by `amt`, poolFree rises by `amt`, totalCollateral/putEscrow unchanged.
-    function lpDeposit(uint256 amt) external {
+    function lpDeposit(uint256 amt) external onlyOwner {
         vault.pullUsdc(msg.sender, amt);
         emit LpDeposited(msg.sender, amt);
     }
@@ -520,7 +606,7 @@ contract EverlastingBook {
     /// @notice Withdraw pool-free USDC (the pool's own uncommitted capital).
     /// @dev Only poolFree() may leave — trader collateral and put escrow are off-limits. Conservation
     ///      holds: poolUsdc falls by `amt`, poolFree falls by `amt`, totalCollateral/putEscrow flat.
-    function lpWithdraw(uint256 amt) external {
+    function lpWithdraw(uint256 amt) external onlyOwner {
         require(poolFree() >= amt, "pool-free");
         vault.payoutUsdc(msg.sender, amt);
         emit LpWithdrawn(msg.sender, amt);

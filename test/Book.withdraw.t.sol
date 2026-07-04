@@ -143,12 +143,12 @@ contract BookWithdrawTest is Test {
     // ── lpDeposit / lpWithdraw ────────────────────────────────────────────────
 
     /// @dev lpDeposit adds the LP's own capital as pool-free USDC (poolFree rises; no collateral).
+    ///      T8: lpDeposit is owner-only; the test contract is the owner (deployer).
     function test_lpDeposit_raises_poolFree() public {
         uint256 freeBefore = book.poolFree();
 
         vm.expectEmit(true, false, false, true, address(book));
-        emit LpDeposited(LP, 250e6);
-        vm.prank(LP);
+        emit LpDeposited(address(this), 250e6);
         book.lpDeposit(250e6);
 
         assertEq(book.poolFree(), freeBefore + 250e6, "poolFree += amt");
@@ -158,13 +158,12 @@ contract BookWithdrawTest is Test {
     }
 
     /// @dev lpWithdraw removes pool-free USDC only.
+    ///      T8: both lp funcs are owner-only; the test contract is the owner.
     function test_lpWithdraw_reduces_poolFree() public {
-        vm.prank(LP);
         book.lpDeposit(250e6);
 
         vm.expectEmit(true, false, false, true, address(book));
-        emit LpWithdrawn(LP, 100e6);
-        vm.prank(LP);
+        emit LpWithdrawn(address(this), 100e6);
         book.lpWithdraw(100e6);
 
         assertEq(book.poolFree(), 150e6, "poolFree -= amt");
@@ -173,13 +172,13 @@ contract BookWithdrawTest is Test {
     }
 
     /// @dev lpWithdraw cannot touch trader collateral or escrow → "pool-free" when amt > poolFree.
+    ///      T8: owner calls lpWithdraw (owner-only); revert is pool-free guard, not onlyOwner.
     function test_lpWithdraw_reverts_over_poolFree() public {
         // All physical USDC is trader collateral (poolFree = 0).
         vm.prank(ALICE);
         book.deposit(CALL, 100e6);
         assertEq(book.poolFree(), 0, "no pool-free");
 
-        vm.prank(LP);
         vm.expectRevert(bytes("pool-free"));
         book.lpWithdraw(1);
     }
@@ -197,7 +196,6 @@ contract BookWithdrawTest is Test {
         assertEq(book.putEscrow(), 50e6, "escrow locked");
         assertEq(book.poolFree(), 0, "poolFree consumed by escrow");
 
-        vm.prank(LP);
         vm.expectRevert(bytes("pool-free"));
         book.lpWithdraw(1);                        // cannot pull escrowed USDC
         assertTrue(_conservation(), "conservation");
