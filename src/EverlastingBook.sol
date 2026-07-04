@@ -84,6 +84,9 @@ contract EverlastingBook {
     event Deposited(Side indexed side, address indexed trader, uint256 amt);
     event Opened(Side indexed side, address indexed trader, uint256 qty, uint256 mark);
     event MarkPosted(Side indexed side, uint256 mark, uint256 cumFunding);
+    /// @notice Emitted on every close and settle.
+    /// @param coverSold  HYPE WAD sold from cover to fund a winning payout (0 on loss branch).
+    event Closed(address indexed trader, int256 net, uint256 coverSold);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -228,5 +231,117 @@ contract EverlastingBook {
         Position memory p = positions[uint8(side)][t];
         if (p.qty == 0) return 0;
         return p.qty * (sideState[uint8(side)].cumFunding - p.entryCumFunding) / 1e18;
+    }
+
+    // ── netLossUsdc (I2 insolvency predicate) ─────────────────────────────────
+
+    /// @notice Trader's net loss in USDC for the given side (6dp). Zero when net gain.
+    ///         The I2 insolvency predicate: settle fires when netLossUsdc > traderCollateral.
+    ///         Mirrors CoveredCallMarket.netLossUsdc, parameterised by side.
+    /// @dev    PUT: placeholder — T6 implements.
+    function netLossUsdc(Side side, address t) public view returns (uint256) {
+        if (side == Side.PUT) revert("put: enabled in T6");
+        uint8 s = uint8(side);
+        Position memory p = positions[s][t];
+        if (p.qty == 0) return 0;
+        SideState storage ss = sideState[s];
+        uint256 fundingU = _toUsdc(p.qty * (ss.cumFunding - p.entryCumFunding) / 1e18);
+        uint256 markGainU;
+        uint256 markLossU;
+        if (ss.mark >= p.entryMark) {
+            markGainU = _toUsdc(p.qty * (ss.mark - p.entryMark) / 1e18);
+        } else {
+            markLossU = _toUsdc(p.qty * (p.entryMark - ss.mark) / 1e18);
+        }
+        uint256 debit = markLossU + fundingU;
+        return debit > markGainU ? debit - markGainU : 0;
+    }
+
+    // ── Close / Settle ────────────────────────────────────────────────────────
+
+    /// @dev Internal: close a COVERED_CALL position for trader `t`.
+    ///
+    ///      I3 (cover→USDC): on a positive trader net g, sell cover to fund the payout:
+    ///        1. Compute hypeForG = (g in WAD) / spotPx — the HYPE needed to raise g USDC.
+    ///        2. Floor to szDecimals=2 tick (0.01 HYPE = 1e16 WAD). Dust stays in coverHype.
+    ///        3. Call vault.sellCover(flooredHype) if flooredHype > 0 and cover is available.
+    ///        4. Source the payout from vault.poolUsdc() — NEVER from sellCover's return (M3).
+    ///
+    ///      M3 SAFETY: vault.sellCover returns an ESTIMATE; the real CoreCoverVault fill is
+    ///      async (T9 concern). MockCoverVault credits poolUsdc synchronously, making T5 testable,
+    ///      but the book MUST rely on the physical vault.poolUsdc() balance, not the return value.
+    ///      Reading the return to credit any ledger would double-count the proceeds.
+    ///
+    ///      No int256 intermediate: gain/loss split kept in uint256, cast only at emit boundary.
+    ///      Precision favours the pool: _toUsdc truncates and szDecimals floor leaves dust.
+    function _closeCall(address t) internal {
+        uint8 s = uint8(Side.COVERED_CALL);
+        SideState storage ss = sideState[s];
+        Position memory p = positions[s][t];
+        require(p.qty > 0, "no position");
+
+        uint256 fundingU = _toUsdc(p.qty * (ss.cumFunding - p.entryCumFunding) / 1e18);
+
+        // Mark PnL split in uint256 — avoids int256 intermediate (mirrors CoveredCallMarket._closeFor)
+        uint256 markGainU;
+        uint256 markLossU;
+        if (ss.mark >= p.entryMark) {
+            markGainU = _toUsdc(p.qty * (ss.mark - p.entryMark) / 1e18);
+        } else {
+            markLossU = _toUsdc(p.qty * (p.entryMark - ss.mark) / 1e18);
+        }
+
+        uint256 flooredHype; // set in gain branch; stays 0 on loss branch
+
+        if (markGainU >= markLossU + fundingU) {
+            // ── Gain branch ──────────────────────────────────────────────────
+            uint256 g = markGainU - markLossU - fundingU;
+            // I3: fund g by selling cover
+            uint256 spotPxWad = vault.spotPxUsdc();            // WAD USDC per HYPE
+            // g (6dp) → WAD → divide by spot → HYPE WAD
+            uint256 hypeForG = (g * 1e12) * 1e18 / spotPxWad;
+            // forge-lint: disable-next-line(divide-before-multiply) -- intentional szDecimals floor
+            flooredHype = (hypeForG / 1e16) * 1e16;            // tick = 0.01 HYPE = 1e16 WAD
+            if (flooredHype > 0 && flooredHype <= vault.coverHype()) {
+                // M3: do NOT read the return value — sellCover's return is an estimate.
+                // MockCoverVault credits poolUsdc synchronously; CoreCoverVault is async (T9).
+                vault.sellCover(flooredHype);
+            }
+            // Source payout from physical vault balance (M3 safety — never from sellCover return)
+            require(vault.poolUsdc() >= g, "pool");
+            // Credit trader; pool free (= poolUsdc − Σ traderCollateral) decreases by g
+            traderCollateral[s][t] += g;
+            ss.netWritten -= p.qty;
+            delete positions[s][t];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            emit Closed(t, int256(g), flooredHype);
+        } else {
+            // ── Loss branch ──────────────────────────────────────────────────
+            uint256 l = markLossU + fundingU - markGainU;
+            if (l > traderCollateral[s][t]) l = traderCollateral[s][t]; // auto-settle floor
+            traderCollateral[s][t] -= l;
+            // l implicitly accrues to pool free (poolUsdc unchanged; Σ traderCollateral drops)
+            ss.netWritten -= p.qty;
+            delete positions[s][t];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            emit Closed(t, -int256(l), 0);
+        }
+    }
+
+    /// @notice Close msg.sender's position on the given side.
+    /// @dev    PUT: placeholder — T6 implements.
+    function close(Side side) external {
+        if (side == Side.PUT) revert("put: enabled in T6");
+        _closeCall(msg.sender);
+    }
+
+    /// @notice Permissionless force-close when the position's net loss exceeds collateral (I2).
+    ///         Anyone may call this once a position is insolvent; keeper may call during mark updates.
+    /// @dev    PUT: placeholder — T6 implements.
+    function settle(Side side, address t) external {
+        if (side == Side.PUT) revert("put: enabled in T6");
+        require(positions[uint8(side)][t].qty > 0, "no position");
+        require(netLossUsdc(side, t) > traderCollateral[uint8(side)][t], "solvent");
+        _closeCall(t);
     }
 }
