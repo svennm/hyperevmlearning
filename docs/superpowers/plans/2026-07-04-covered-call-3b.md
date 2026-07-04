@@ -38,6 +38,14 @@ sim, then live smoke). Most logic stays fast/pure; CoreWriter risk is isolated t
 - **Per-side caps:** independent `putCapNotional` / `callCapNotional` params; risks compound on the
   downside (covered call ≡ short put, same side as the put book), so each side is bounded and a
   binding cap is emitted.
+- **Events (every state change):** emit on deposit/withdraw, cover buy/sell (with filled size + px +
+  dust), openLong, close/settle (signed net + any cover sold), keeper/owner change, pause, and
+  cap/param updates. The off-chain keeper + the conservation reasoning depend on these — a
+  state-changing path with no event is a defect, not a style choice.
+- **Precision discipline:** rounding is deterministic and never creates value; where a rounding choice
+  exists it favors the pool (round trader payouts down, trader debits up). `_toUsdc` truncation and
+  szDecimals flooring are the only lossy steps; the T7 conservation invariant is the backstop that
+  proves no value leaks.
 - **Collateral lives on Core (D2):** `poolUsdc` and cover HYPE are the contract's HyperCore spot
   balances; the EVM contract reads them via `PrecompileLib.spotBalance` and moves them via CoreWriter.
   `MockCoverVault` models this as plain ledgers for the pure tests.
@@ -144,7 +152,32 @@ via `vault.pullUsdc`/`payoutUsdc` (Core-spot model). Reconciliation: openLong ga
 **Audit focus (CRITICAL):** conservation is non-vacuous and holds under fuzzed spot→∞ AND spot→0
 (downside is where put payout + cover collapse compound); cover gate never violated; caps bind.
 
-### Task 8: Live testnet integration — deploy `CoreCoverVault` + book, 2-sided smoke
+### Task 8: Admin, emergency controls, events & precision sweep
+**Files:** Modify `src/EverlastingBook.sol`, `src/CoreCoverVault.sol`; Create `test/Book.admin.t.sol`
+**Consumes:** Tasks 1–7.
+**Produces:**
+- **Roles:** `owner` + `keeper`; owner-gated `setKeeper(addr)` and **2-step** `transferOwnership`/
+  `acceptOwnership` (no single-tx owner loss). Addresses 3a review M3 (keeper had no setter).
+- **Pause:** `pause()`/`unpause()` (owner) blocks new `openLong` (both sides) + cover buys, but
+  ALWAYS allows `close`/`settle`/`withdraw`/`sellCover` and `postMark` — a de-risk switch, never a
+  fund trap. Users and the pool can always exit while paused.
+- **Emergency cover unwind:** owner-only `emergencyUnwindCover()` (paused-only) — sell all cover →
+  `poolUsdc` respecting szDecimals floor + dust, for wind-down.
+- **Rescue:** owner-gated `spotSend` of stray non-collateral balances (already on `CoreCoverVault`
+  from the spike — expose owner-gated on the book path).
+- **Events sweep:** verify EVERY state-changing path emits per the Global-Constraints events rule; add
+  any missing.
+- **Precision sweep:** verify each `_toUsdc`/floor rounds in the pool's favor; add an adversarial
+  round-trip test proving no op creates value (`poolUsdc + coverEquity` non-decreasing ex-payout).
+**Behavior spec for qwen:** pause never traps funds (close/withdraw work while paused); ownership is
+2-step; `emergencyUnwindCover` only when paused. YAGNI — only these controls, nothing more.
+**Tests:** setKeeper gating; 2-step ownership (pending→accept; stray accept reverts); pause blocks
+open but allows close/withdraw; emergencyUnwind sells all cover to pool (floored); `vm.expectEmit` on
+each state-changing path; precision round-trip creates no value.
+**Audit focus:** pause cannot trap funds (exit paths always open); ownership can't be lost in one tx;
+emergencyUnwind respects szDecimals; event coverage complete; rounding always pool-favorable.
+
+### Task 9: Live testnet integration — deploy `CoreCoverVault` + book, 2-sided smoke
 **Files:** Create `script/DeployBook.s.sol`, `docs/RUNBOOK-3b.md`
 **Consumes:** all.
 **Produces:** deploy `CoreCoverVault` + `EverlastingBook` (vault = the real Core vault) on testnet 998;
@@ -156,8 +189,12 @@ share the pool, funds recoverable.
 
 ## Self-Review
 - Spec coverage: adapter seam (T1–T2), two-sided book skeleton (T3), covered-call open/close with I3+I2
-  (T4–T5), put fold-in (T6), extended solvency + caps + reconciliation (T7), live 2-sided smoke (T8) —
-  maps to design D1 (F1 unified), D2 (Core-spot), D3 (pre-funded cover), and the I3 fix.
+  (T4–T5), put fold-in (T6), extended solvency + caps + reconciliation (T7), admin/emergency/events/
+  precision sweep (T8), live 2-sided smoke (T9) — maps to design D1 (F1 unified), D2 (Core-spot),
+  D3 (pre-funded cover), and the I3 fix.
+- Production hardening: events on every state change (global constraint + T8 sweep), pool-favorable
+  rounding discipline (global constraint + T8 precision test), admin/emergency controls (T8: 2-step
+  ownership, keeper setter, pause-that-can't-trap-funds, emergency unwind, rescue).
 - Reuse, not rewrite: put mechanics from `EverlastingMarket` (slice2), call accounting/funding/I2 from
   `CoveredCallMarket` (3a); only the collateral/settlement layer (vault) and the fold are new.
 - CoreWriter risk isolated to `CoreCoverVault` (T2), tested via CoreSimulatorLib + live; the book and
