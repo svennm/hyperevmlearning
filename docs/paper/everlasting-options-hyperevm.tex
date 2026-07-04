@@ -1,0 +1,535 @@
+\documentclass[11pt]{article}
+
+% ---------------------------------------------------------------------------
+% Everlasting Options on HyperEVM --- project write-up / research note
+% Build:  pdflatex everlasting-options-hyperevm.tex   (run twice for refs)
+%    or:  tectonic everlasting-options-hyperevm.tex
+% Self-contained: only stock TeX Live packages, no shell-escape needed.
+% ---------------------------------------------------------------------------
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue!55!black]{hyperref}
+
+\lstdefinestyle{code}{%
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{black!25},
+  backgroundcolor=\color{black!4},
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+}
+\lstset{style=code}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{\textbf{Everlasting Options on HyperEVM}\\[2pt]
+\large Funding-Settled, Liquidation-Free Options with On-Chain HyperCore Cover}
+\author{SvennM\\[2pt]\small\url{https://github.com/your-handle/hyperevmlearning}}
+\date{July 3, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note documents an in-progress, fully on-chain \emph{everlasting options} venue built on
+Hyperliquid's HyperEVM (chain 998). Everlasting options never expire; in place of an expiry date,
+longs pay an hourly funding fee equal to $(\text{mark}-\text{intrinsic})$ into a collateral pool,
+turning the expiry cliff into a continuous carry (White \& Bankman-Fried, Paradigm 2021). The venue
+is peer-to-pool, fully collateralized, and replaces liquidation with deterministic auto-settlement.
+Slice~1 --- an everlasting put with a cumulative-funding engine and auto-settle --- is deployed and
+smoke-tested on HyperEVM testnet. Slice~2 (a capped call spread, a protocol fee, and an opt-in yield
+float) and Slice~3a (an \emph{uncapped} covered call with an on-chain cover ledger and cover-gate)
+are code-complete behind a fuzz/invariant test suite that asserts solvency conservation on every
+run. The paper's empirical core is a live-testnet \emph{spike} (Slice~3b) that drives a real HYPE
+perpetual ``cover'' from a smart contract through Hyperliquid's CoreWriter system contract, pinning
+several undocumented encoding rules and surfacing a blocking result: CoreWriter's action set exposes
+no way to set leverage or margin mode, forcing a contract-opened perp into liquidatable isolated
+margin --- which inverts the cover design from a perpetual hedge back to spot. We close with a
+verified feasibility study for extending the same funding machine to real-world-asset (HIP-3) perps.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+\hrule
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+
+\textbf{Everlasting options} are the option analogue of the perpetual swap. Rather than expire, a
+position accrues a periodic \emph{funding} payment; longs pay shorts an amount that tracks the gap
+between the option's traded mark and its current intrinsic value, so the contract can be held
+indefinitely while remaining anchored to fair value~\cite{paradigm}. This removes the operational
+pain of expiries and roll dates, and it turns an option book into something that looks, mechanically,
+like a funding-settled perpetual.
+
+\textbf{Why HyperEVM.} Hyperliquid pairs a high-performance on-chain central limit order book
+(``HyperCore'', the L1) with a general EVM (``HyperEVM'') that can \emph{read} L1 state through
+precompiles and \emph{write} L1 actions through a system contract (``CoreWriter''). That coupling is
+unusual: an EVM smart contract can price an option against the same oracle Hyperliquid uses for its
+own funding and liquidation, and can hedge or collateralize itself by placing real orders on the L1
+order book --- without an off-chain relayer in the critical path. This project asks how far a
+self-collateralizing, self-hedging options venue can be pushed purely on-chain on that substrate.
+
+\textbf{Contributions.} This write-up consolidates the project's research to date:
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt]
+  \item A generalized \code{EverlastingMarket} contract (put and capped call) with a cumulative
+        funding index, full collateralization, and auto-settlement instead of liquidation
+        (Section~\ref{sec:arch}).
+  \item An \emph{uncapped} covered-call design whose short-call risk is backed by an on-chain
+        \emph{cover} position rather than cash, guarded by a cover-gate invariant
+        (Section~\ref{sec:covered}).
+  \item A live-testnet spike that operates a real HYPE perp cover from a contract via CoreWriter,
+        pinning undocumented write/read encoding rules and identifying a leverage-control gap that
+        forces a redesign (Section~\ref{sec:spike}).
+  \item A verified feasibility study for everlasting options on HIP-3 real-world-asset perps
+        (Section~\ref{sec:hip3}).
+\end{enumerate}
+
+\textbf{Scope and honesty.} This is a testnet research project, not audited or production software.
+Collateral is a mock USDC; marks are posted by an off-chain keeper under on-chain guards; deployed
+addresses are throwaway. Claims below are annotated as \emph{deployed}, \emph{code-complete}, or
+\emph{empirically verified on testnet/mainnet} accordingly.
+
+% ===========================================================================
+\section{Background}
+% ===========================================================================
+
+\subsection{Everlasting option mechanics}
+
+For a strike $K$ and underlying spot $S$, the intrinsic value per unit is
+\[
+\text{intrinsic}_{\text{put}} = \max(K-S,\,0), \qquad
+\text{intrinsic}_{\text{call}} = \max(S-K,\,0).
+\]
+A keeper posts a \emph{mark} $m \geq \text{intrinsic}$ each funding period. Longs pay funding
+\[
+\text{funding per unit per period} \;=\; m - \text{intrinsic},
+\]
+accrued through a \emph{cumulative funding index} so that a position's owed funding is the difference
+of the index between open and settlement times, scaled by size. Because a long's downside is bounded
+(an option is never worth less than zero) and the pool is fully collateralized, the venue can replace
+liquidation with \emph{auto-settlement}: when a position's accrued funding (and, for the covered call,
+its mark losses) would exceed its posted collateral, anyone may permissionlessly settle it, capping
+the loss at the collateral and returning the position to the pool.
+
+\subsection{HyperEVM $\leftrightarrow$ HyperCore}
+
+Two facilities connect the EVM to the L1:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Read precompiles} (address range \code{0x...0800}) expose L1 state to EVM
+        \code{staticcall}: \code{oraclePx} / \code{markPx} (per-asset oracle and mark price),
+        \code{position} (a user's perp position), \code{withdrawable}, \code{accountMarginSummary},
+        and \code{coreUserExists}.
+  \item \textbf{CoreWriter} (system contract \code{0x3333...3333}, entrypoint \code{sendRawAction})
+        submits L1 actions: place limit order (action id 1), transfer between spot/perp, spot send,
+        set account abstraction (unified account), add API wallet, and vault transfer --- 16 actions
+        in total.
+\end{itemize}
+A recurring subtlety, pinned empirically in Section~\ref{sec:spike}, is that \emph{reads and writes
+do not share a number system}: the price/size scale used by CoreWriter orders differs from the scale
+returned by the read precompiles, and for builder-deployed (HIP-3) markets even the \emph{asset id}
+differs between the read and write paths.
+
+% ===========================================================================
+\section{System architecture}\label{sec:arch}
+% ===========================================================================
+
+The contracts are Foundry/Solidity \code{0.8.35} (\code{evm\_version = cancun}) and depend on the
+\code{hyper-evm-lib} submodule, which wraps the HyperCore precompiles and CoreWriter. The
+implementation plan was hardened by a 45-agent adversarial audit (16 findings, 4 blockers fixed)
+before any contract was written; the resulting fixes are cited inline in the code as
+\code{AUDIT F1..F6}, and later review findings as \code{I1..I3}.
+
+\subsection{Oracle --- \code{OracleLib}}
+\code{OracleLib.spotWad()} reads HYPE's canonical price via \code{oraclePx(135)} and rescales it to
+WAD (18-dp). The read precompile returns price $\times\,10^{6-\text{szDecimals}}$; for HYPE
+($\text{szDecimals}=2$) that is $\times\,10^{4}$, so the library multiplies by $10^{14}$ to reach
+WAD. This is the same feed Hyperliquid uses for its own funding and liquidation, consumed
+trustlessly on-chain.
+
+\subsection{Market --- \code{EverlastingMarket(side, K, W)}}
+One contract serves both sides via \code{enum Side \{ PUT, CALL \}} and immutables $K$ (strike) and
+$W$ (maximum payout per unit). Intrinsic value is clamped to $[0, W]$: a put uses $W = K$; a capped
+call (a call \emph{spread}) uses $W = K_{hi}-K$, bounding payout at $W$.
+
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item \code{openLong(qty)} escrows initial margin $\text{IM} = \text{qty}\cdot W$ of USDC from the
+        pool's free balance into a locked balance, and guards $\text{mark}>0$, mark staleness
+        (\code{MAX\_MARK\_AGE = 7200\,s}), and one position per trader.
+  \item \code{postMark(m)} is keeper-only and enforces $m \geq \text{intrinsic}$, $m \leq W$, a
+        deviation cap (\code{MAX\_MARK\_DEV\_BPS = 2000}, i.e.\ 20\%), and staleness. It advances
+        \code{cumFunding += (m - lastIntrinsic) * periods} with \code{FUNDING\_PERIOD = 3600\,s}.
+        Funding uses the \emph{contemporaneous} intrinsic (fix \code{F3}); a stale gap is treated as
+        a recoverable re-seed rather than a jump (fix \code{F5}).
+  \item \code{close()} settles funding plus mark PnL and releases escrow \emph{before} paying out, so
+        the payout \code{require} can never false-revert (fix \code{F2}); a loss is floored at the
+        trader's collateral (``never below zero'').
+  \item \code{settle(t)} is the permissionless auto-settle path when funding alone would exceed
+        collateral.
+  \item \textbf{Protocol fee:} \code{protocolFeeBps} (capped at \code{MAX\_FEE\_BPS = 2000}) skims a
+        cut of the funding carry \emph{after} the trader is paid, floored at the free pool so it can
+        never cause a shortfall.
+  \item \textbf{Yield float:} an opt-in \code{IYieldAdapter} sweeps idle free capital to yield while
+        keeping at least \code{reserveBps = 2000} (20\%) liquid in-contract; \code{deployedToYield}
+        tracks principal.
+\end{itemize}
+
+\subsection{Uncapped covered call --- \code{CoveredCallMarket}}\label{sec:covered}
+The ``real product'' is an \emph{uncapped} everlasting call: $\text{intrinsic} = \max(S-K,0)$ with
+\emph{no upper clamp}. Uncapped upside for the buyer cannot be cash-collateralized cheaply, so the
+short-call risk is instead backed by a long-underlying \emph{cover}:
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item \textbf{Cover ledger.} \code{coverQty} and a quantity-weighted average \code{coverEntry};
+        \code{increaseCover(qty)} updates the entry as
+        $\text{coverEntry} \leftarrow \dfrac{\text{coverQty}\cdot\text{coverEntry} + \text{qty}\cdot S}
+        {\text{coverQty}+\text{qty}}$, and \code{reduceCover(qty)} reverts if it would drop cover
+        below the net written size.
+  \item \textbf{Cover-gate.} \code{openLong} requires
+        $\text{coverQty} \geq \text{netWritten} + \text{addQty}$ --- a call can be written only if the
+        pool already holds enough cover to back it.
+  \item \textbf{Settlement predicate.} Because initial margin here is premium-only
+        ($\text{qty}\cdot\text{mark}$, not $\text{qty}\cdot W$), \code{settle(t)} uses the \emph{full}
+        net-loss predicate $\text{netLoss} = \text{markLoss} + \text{funding} - \text{markGain}$
+        (fix \code{I2}); a funding-only predicate would miss mark losses and lock out the keeper.
+\end{itemize}
+The open question this design defers is \emph{realizing the cover into USDC on payout} --- i.e.\
+whether the pool can actually hold a live cover position on HyperCore. That is exactly what the
+Slice-3b spike (Section~\ref{sec:spike}) probes.
+
+\subsection{Off-chain keeper}
+A TypeScript keeper posts the mark hourly. The mark is a geometric basket of Black--Scholes prices
+across twelve horizons, approximating the everlasting's continuously-rolled term structure:
+\[
+\text{mark}_{\text{put}} = \sum_{i=1}^{12} 2^{-i}\,\text{BS}_{\text{put}}(K,\tau_i),
+\qquad
+\text{mark}_{\text{call}} = \sum_{i=1}^{12} 2^{-i}\big[\text{BS}_{\text{call}}(K,\tau_i)-\text{BS}_{\text{call}}(K_{hi},\tau_i)\big],
+\]
+clamped to $[\text{intrinsic}, W]$ before posting. Volatility $\sigma$ is currently hand-set
+(default 0.9). The keeper is the one trusted off-chain component; its authority is bounded on-chain by
+the \code{postMark} guards (bounds, deviation cap, staleness).
+
+% ===========================================================================
+\section{Verification}
+% ===========================================================================
+
+Testing is Foundry-based and mixes unit, fuzz, invariant, and live-fork tests --- 46 tests at the
+Slice-2 snapshot, growing to roughly 84 test functions across 24 files on the current branch with
+Slice-3a/3b added. Three tests are live-fork (they read the testnet oracle and need an RPC env).
+
+The invariant suites are the load-bearing ones. Each uses \emph{nonce prediction} so that the fuzz
+handler \emph{is} the keeper (it can post marks the way production would), and each has an
+\code{afterInvariant()} non-vacuity guard (\code{assertGt(marksPosted, 0)}) so a suite cannot pass by
+doing nothing. Table~\ref{tab:inv} lists what each asserts.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Suite} & \textbf{Invariant} & \textbf{Asserts} \\
+\midrule
+\code{EverlastingPut}  & \code{invariant\_solvency}     & $\text{bal} = \text{poolFree}+\text{poolLocked}+\sum\text{collateral}$ \\
+\code{EverlastingCall} & \code{invariant\_solvency}     & same, with spot fuzzed above $K_{hi}$ \\
+\code{FeeFloat}        & \code{invariant\_conservation} & $\text{bal} = \text{poolFree}+\text{poolLocked}+\sum\text{coll}+\text{fee}$ \\
+                       &                                & \emph{and} $\text{adapter.balance} \geq \text{deployedToYield}$ \\
+\code{CoveredCall}     & \code{invariant\_conservation} & $\text{bal} = \text{poolUsdc}+\sum\text{collateral}$ \\
+\code{CoveredCall}     & \code{invariant\_coverGate}    & $\text{coverQty} \geq \text{netWritten}$ \\
+\bottomrule
+\end{tabular}
+\caption{Invariants. The put suite was verified non-vacuous over 256 runs / 128k calls
+($\approx$15k \code{postMark}s + 21k opens/settles).}
+\label{tab:inv}
+\end{table}
+
+\textbf{An honesty note worth recording.} The covered-call solvency invariant was \emph{rewritten
+during review}: the original \code{invariant\_solvencyGivenCover} was found vacuous and replaced
+(commit ``\emph{replace vacuous solvency invariant with conservation + cover-gate}'', fix \code{I1}).
+The replacement tests explicitly document their own limit --- the cover-gate proves enough cover
+\emph{exists}, but not that the pool can fund \code{close()} payouts by realizing that cover into
+USDC, which is precisely the Slice-3b question. Naming what a test does \emph{not} prove is, in
+practice, more valuable than the green check.
+
+% ===========================================================================
+\section{The CoreWriter cover spike (Slice 3b)}\label{sec:spike}
+% ===========================================================================
+
+\textbf{Question.} Can a HyperEVM contract hold a real HYPE perpetual as cover --- open, read, and
+close it --- entirely on-chain through CoreWriter? Before writing the production
+\code{CoveredCallMarket3b}, a deliberately \emph{throwaway} spike
+(\code{src/spike/PerpCoverSpike.sol}, an \code{onlyOwner} probe) was deployed to testnet
+(\code{0x8Bc3f8...D4A8}) and driven through a full round-trip.
+
+\subsection{What worked}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \textbf{Contract-driven perp lifecycle.} Opened 0.5 HYPE long at \$79.22 and closed it, all
+        from contract \code{onlyOwner} calls routed through CoreWriter; fills confirmed via
+        \code{userFills}, position read back via the \code{position} precompile.
+  \item \textbf{Unified account from the contract.} \code{setAbstraction(self, 2)} flipped the
+        contract's Core account to a unified account, so spot USDC directly margins the perp --- no
+        explicit spot$\to$perp class transfer needed.
+  \item \textbf{PnL settles to spot USDC.} On close, the balance went $120.000 \to 119.140$ USDC in
+        the unified spot balance --- so realizing cover into USDC on a covered-call payout (the
+        deferred \code{I3} step) is mechanically clean: close the perp, USDC lands in spot, then
+        \code{spotSend} onward.
+  \item \textbf{Rescue path.} \code{spotSendUsdc} returned the full 119.14 USDC to the funding user.
+\end{itemize}
+
+\subsection{Encoding, pinned empirically}
+The genuinely hard-won, undocumented bits (Table~\ref{tab:scale}, Table~\ref{tab:assetid}):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Quantity} & \textbf{Encoding} & \textbf{Example} \\
+\midrule
+Order \code{limitPx} (write) & human $\times\,10^{8}$ & \$85 $\to$ \code{85e8} \\
+Order \code{sz} (write)      & human $\times\,10^{8}$ & 0.5 HYPE $\to$ \code{5e7} \\
+\code{oraclePx}/\code{markPx} (read) & price $\times\,10^{6-\text{szDec}}$ & HYPE ($\text{szDec}=2$): $\times\,10^{4}$ \\
+\code{position.szi} (read)   & coins $\times\,10^{\text{szDec}}$ & --- \\
+\bottomrule
+\end{tabular}
+\caption{Write-scale $\neq$ read-scale. A first attempt that reused the \emph{read} price scale
+($\text{price}\times 10^{4}$) as an order \code{limitPx} \textbf{silently 0-filled} --- CoreWriter
+expired the order with no revert and no fill.}
+\label{tab:scale}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Market} & \textbf{Read precompile id} & \textbf{CoreWriter action asset id} \\
+\midrule
+Main perp dex (dex 0), e.g.\ HYPE & \code{135} (= perp index) & \code{135} (same) \\
+HIP-3 builder dex, e.g.\ \code{xyz:GOLD} & \code{dex$\cdot$10000+idx} (10003) & \code{100000+dex$\cdot$10000+idx} (110003) \\
+\bottomrule
+\end{tabular}
+\caption{On the main dex the read and write ids coincide; on a builder (HIP-3) dex they differ.
+Passing the write id to a read precompile reverts (\code{PrecompileError}).}
+\label{tab:assetid}
+\end{table}
+
+CoreWriter is also \emph{fire-and-forget and delayed}: a fill lands a Core block later, so reads
+issued immediately after a write still show pre-fill state (``poll one block after the write'').
+
+\subsection{Live round-trip}
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Step} & \textbf{Action} & \textbf{Result} \\
+\midrule
+Fund  & Core spot send 120 USDC & account funded \\
+Open  & 0.5 HYPE long @ \$79.22, marketable IOC & filled, isolated $10\times$ \\
+Read  & \code{position} precompile & szi 0.5, entry \$79.22, liqPx \$71.74 \\
+Close & \code{reduceOnly} IOC @ \$75.68 (bid) & filled, PnL $\to$ spot USDC \\
+Sweep & \code{spotSend} to user & 119.14 USDC returned \\
+\bottomrule
+\end{tabular}
+\caption{Full contract-driven round-trip on testnet. Round-trip cost \$0.86
+($120.00 \to 119.14$), dominated by the thin \emph{testnet} book spread (bought \$79.22 ask, sold
+\$75.68 bid) --- not representative of mainnet.}
+\label{tab:roundtrip}
+\end{table}
+
+\subsection{The blocking finding}
+A contract-opened perp cover opens \textbf{isolated, at the asset's max leverage ($10\times$ on HYPE),
+and is liquidatable} --- in the live run the liquidation price sat at \$71.74, about $-9.4\%$ from
+entry, backed by only $\approx\$4.86$ of margin. Even with the account set to unified, the
+\emph{position} opened isolated $10\times$.
+
+Critically, \textbf{CoreWriter's action set (ids 1..16) contains no \code{updateLeverage}, no
+cross/isolated toggle, and no add-isolated-margin action.} From a pure on-chain flow the cover
+therefore \emph{cannot} be made cross, $1\times$, or otherwise non-liquidatable. This breaks the
+covered-call premise directly: the cover must be fully-funded / non-liquidatable, or a HYPE drawdown
+liquidates the cover and leaves the pool short a naked uncapped call --- insolvency.
+
+\subsection{Design fork}
+\begin{itemize}[leftmargin=1.4em,itemsep=3pt]
+  \item \textbf{Option A --- spot HYPE cover (recommended).} Hold spot HYPE (CoreWriter spot buy,
+        asset $10000+\text{spotIndex}$). No leverage, no liquidation, ever --- the textbook
+        covered-call structure of owning the underlying. Ties up full notional and earns no funding,
+        but is trustless and bulletproof; close $=$ sell spot $\to$ USDC.
+  \item \textbf{Option B --- perp cover + off-chain leverage set.} Keep the perp (capital-efficient,
+        earns funding), but since CoreWriter cannot set $1\times$/cross, use action~9 (add API
+        wallet): the contract approves an agent EOA, and an off-chain keeper signs a one-time
+        \code{updateLeverage(cross, 1$\times$)} L1 action for the contract account. Adds a trusted
+        off-chain signer --- less trustless.
+  \item \textbf{Option C --- perp cover + active margin management.} Keep isolated but have a keeper
+        continuously keep the position far from its liquidation price. Highest ongoing
+        trust/complexity; a bad-block or oracle gap can still liquidate. Weakest.
+\end{itemize}
+\textbf{Recommendation.} The spike \emph{inverts} the earlier ``perp cover'' decision. Given the
+covered call needs a non-liquidatable cover and CoreWriter cannot set leverage, Option~A (spot
+cover) is now the clean path; Option~B is viable only if funding income and capital efficiency are
+worth an off-chain agent. Learning this from an \$0.86 probe rather than a production position is the
+whole point of spiking first.
+
+% ===========================================================================
+\section{Extension: everlasting options on HIP-3 RWA perps}\label{sec:hip3}
+% ===========================================================================
+
+A separate feasibility study (verdict: \textbf{green --- both legs empirically verified}) asks whether
+the same funding machine can be pointed at \emph{real-world-asset} perps: equities, indices,
+commodities, and FX listed on HIP-3 builder markets. The dominant HIP-3 RWA venue is Trade.xyz
+(\code{perp\_dex\_index = 1}, $\approx$98 markets; S\&P-500 licensed as of March 2026). Trading is
+permissionless on-chain --- the $\sim$500k HYPE stake gates \emph{deploying} a market, not trading.
+
+\textbf{Read path --- verified on mainnet.} A HyperEVM contract reads any \code{xyz:} market's oracle
+via the \code{oraclePx}/\code{markPx} precompiles, with read index $=\text{dex}\cdot 10000+\text{idx}$.
+On-chain reads matched the live info-API oracle across six markets (Table~\ref{tab:rwa}), confirming
+the pricer and funding engine can consume the HIP-3 oracle on-chain.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Market} & \textbf{Read id} & \textbf{Precompile \code{oraclePx}} & \textbf{Info-API oracle} \\
+\midrule
+\code{xyz:GOLD}  & 10003 & \$4116.6 & \$4116.2 \\
+\code{xyz:NVDA}  & 10002 & \$192.85 & \$192.77 \\
+\code{xyz:TSLA}  & 10001 & \$393.69 & \$393.66 \\
+\code{xyz:AAPL}  & 10009 & \$307.45 & \$307.47 \\
+\code{xyz:SP500} & 10052 & \$7443.7 & \$7442.1 \\
+\code{xyz:ORCL}  & 10011 & \$139.60 & \$139.62 \\
+\bottomrule
+\end{tabular}
+\caption{On-chain \code{staticcall} vs live info-API oracle (mainnet, 2026-07-02).}
+\label{tab:rwa}
+\end{table}
+
+\textbf{Write/hedge path --- verified on testnet.} A deployed HyperEVM contract funded a HyperCore
+account and sent a marketable IOC via CoreWriter (action asset id $=100000+\text{dex}\cdot 10000+\text{idx}$)
+that \emph{filled}: position \code{szi = 0.5 felix:TEST1}, \code{entryPx = 43.31}. So a contract can
+open, close, and hence delta-hedge a HIP-3 market on-chain.
+
+\textbf{Risks to design around.} (i) A deployer-run centralized oracle (a $\sim$3\,s relayer,
+clamped $\leq 1\%$ per update) lags fast moves and directly hits pricing and hedge accuracy; (ii) a
+deployer \code{haltTrading} force-settles all positions to mark --- for an open-ended everlasting
+option this needs a settlement fallback (secondary oracle / TWAP / auto-unwind); (iii) fees
+$\approx 2\times$ native perps, isolated-margin only, and fire-and-forget delayed writes hit
+slippage and rebalance latency; (iv) $>$90\% single-builder concentration is a systemic dependency.
+Precedent exists (Synapse Labs' Hypercall runs options on a HIP-3-only SpaceX underlying), but the
+general pattern is greenfield.
+
+% ===========================================================================
+\section{Roadmap}
+% ===========================================================================
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}clp{6.3cm}@{}}
+\toprule
+\textbf{Slice} & \textbf{Adds} & \textbf{Status} \\
+\midrule
+1  & Everlasting put, isolated pool, funding, auto-settle & \textbf{Deployed} \& smoked on testnet (\code{0xD48a...C135}, $K=\$47$) \\
+2  & Capped call spread, protocol fee, yield float & Code + tests complete; two-market testnet deploy pending \\
+3a & Uncapped covered call: option accounting, cover ledger, cover-gate & Code + tests complete \\
+3b & CoreWriter perp-cover spike & \textbf{Complete} --- findings invert the cover design (perp $\to$ spot) \\
+4  & Partial margin + liquidation engine & Planned \\
+5  & Insurance fund + ADL & Planned \\
+--- & Multi-strike ladder; frontend; mainnet + external audit & Audit-gated \\
+\bottomrule
+\end{tabular}
+\caption{Build slices. Only the Slice-1 \code{EverlastingPut} is live on-chain.}
+\label{tab:roadmap}
+\end{table}
+
+% ===========================================================================
+\section{Discussion}
+% ===========================================================================
+
+Three lessons generalize beyond this project. First, \textbf{spike before you build}: the most
+consequential result here --- that on-chain leverage control does not exist in CoreWriter --- cost
+\$0.86 and a weekend to find, and it changed a core architectural decision that would have been
+expensive to unwind after the production contract was written. Second, \textbf{the interesting risk
+lives in the encoding}, not the algebra: write-scale $\neq$ read-scale and read-id $\neq$ write-id are
+undocumented, produce \emph{silent} failures (a 0-fill with no revert), and are exactly the kind of
+thing only a live round-trip surfaces. Third, \textbf{invariant tests are only as good as their
+non-vacuity}: replacing a vacuous solvency invariant with a conservation identity plus an explicit
+cover-gate --- and documenting what the gate does \emph{not} prove --- was worth more than the
+original green check.
+
+The venue's remaining trust surfaces are named and bounded: an off-chain keeper posts marks (bounded
+by on-chain guards), and any HIP-3 extension inherits the builder's oracle and halt authority (which
+needs a settlement fallback). The near-term path is to build the Slice-3b covered call on a
+\emph{spot} cover, finish the two-market Slice-2 deploy, and only then revisit the capital-efficiency
+case for a perp cover with an off-chain leverage signer.
+
+% ===========================================================================
+\section{Conclusion}
+% ===========================================================================
+
+An everlasting-options venue can be assembled almost entirely on-chain on HyperEVM: it can price
+against Hyperliquid's own oracle through read precompiles, collateralize and hedge itself by placing
+real L1 orders through CoreWriter, and settle deterministically without a liquidation engine.
+Slice~1 is live on testnet; slices 2 and 3a are code-complete under a solvency-conserving fuzz/invariant
+suite; and the Slice-3b spike both proved contract-driven perp cover works and found the one missing
+primitive --- on-chain leverage control --- that reshapes the cover design. The end goal is a
+permissionless everlasting-options venue whose cover is real and fully on-chain, extensible to
+real-world-asset perps whose read and write paths are already empirically verified.
+
+% ===========================================================================
+\appendix
+\section{Deployed artifacts (testnet, chain 998)}
+% ===========================================================================
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \code{EverlastingPut} --- \code{0xD48aabBd8ad161A68F471045E4c12D67c879C135}, $K=\$47$
+        (Slice-1, live).
+  \item \code{PerpCoverSpike} --- \code{0x8Bc3f867d40576485D8031D1a599A11a0a2FD4A8} (Slice-3b,
+        throwaway probe).
+  \item Toolchain: Foundry (solc \code{0.8.35}, \code{cancun}); submodules \code{forge-std},
+        \code{hyper-evm-lib}; TypeScript keeper (\code{ethers}); GitHub Actions CI
+        (\code{forge fmt --check}, \code{build --sizes}, \code{test}).
+\end{itemize}
+
+\section{Reusable CoreWriter facts}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item Order \code{px}/\code{sz} $=$ human $\times\,10^{8}$; marketable $=$ IOC through the book;
+        poll reads one Core block after a write.
+  \item A fresh contract Core account defaults to classic (disabled) + isolated max leverage;
+        \code{setAbstraction(self, 2)} $\to$ unified.
+  \item PnL on close realizes to the account's spot USDC balance.
+  \item Main-dex order asset id $=$ read perp index (HYPE $=135$); the $100000+$ offset is
+        builder-dex-only.
+\end{itemize}
+
+\section{Plain-language summary}
+\emph{An options market that never expires, built on Hyperliquid. Instead of an expiry date, holders
+pay a small hourly ``funding'' fee, so a position can be held forever while staying priced to fair
+value. It is fully backed by collateral and settles automatically instead of liquidating. The put is
+live on testnet; the call machinery is written and tested; and a weekend experiment proved a smart
+contract can open and close a real HYPE position on Hyperliquid's order book on its own --- while
+revealing that the on-chain toolkit has no way to set leverage, which sent the collateral design back
+to simply owning the asset.}
+
+% ===========================================================================
+\begin{thebibliography}{9}
+% ===========================================================================
+\bibitem{paradigm} D.~White and S.~Bankman-Fried.
+  \emph{Everlasting Options.} Paradigm, 2021.
+  \url{https://www.paradigm.xyz/writing/everlasting-options}.
+\bibitem{hldocs} Hyperliquid.
+  \emph{HyperEVM $\leftrightarrow$ HyperCore precompiles, CoreWriter, Asset IDs, and HIP-3.}
+  Hyperliquid documentation.
+\bibitem{hyperevmlib} \emph{hyper-evm-lib} --- Solidity wrappers for HyperCore precompiles and
+  CoreWriter. \url{https://github.com/hyperliquid-dev/hyper-evm-lib}.
+\bibitem{tradexyz} Trade.xyz --- HIP-3 real-world-asset perpetuals on Hyperliquid.
+\end{thebibliography}
+
+\end{document}
