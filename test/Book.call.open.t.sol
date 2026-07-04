@@ -129,15 +129,17 @@ contract BookCallOpenTest is Test {
         book.openLong(CALL, 1e18);
     }
 
-    /// @dev PUT side not implemented yet → "put: enabled in T6"
-    function test_open_put_reverts_placeholder() public {
-        vm.expectRevert(bytes("put: enabled in T6"));
+    /// @dev PUT is enabled (T6). With no PUT mark posted, openLong(PUT) hits the fresh-mark guard.
+    function test_open_put_reverts_no_mark() public {
+        vm.expectRevert(bytes("no mark"));
         book.openLong(PUT, 1e18);
     }
 
-    function test_postMark_put_reverts_placeholder() public {
-        vm.expectRevert(bytes("put: enabled in T6"));
+    /// @dev PUT postMark works (T6). spot=100=Kput → put intrinsic 0; 5e18 ≤ Wput=50e18 accepted.
+    function test_postMark_put_succeeds() public {
         book.postMark(PUT, 5e18);
+        (uint256 m, , , , ) = book.sideState(uint8(PUT));
+        assertEq(m, 5e18, "put mark stored");
     }
 
     // ── openLong: success path ────────────────────────────────────────────────

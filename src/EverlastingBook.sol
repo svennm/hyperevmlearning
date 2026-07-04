@@ -79,6 +79,27 @@ contract EverlastingBook {
     ///      and poolUsdc is simply credited (no real ERC20 transfer in tests).
     mapping(uint8 => mapping(address => uint256)) public traderCollateral;
 
+    // ── Shared-pool logical ledgers (T6) ──────────────────────────────────────
+    //
+    // The book holds NO cash: vault.poolUsdc() is the ONE physical USDC balance shared
+    // by both sides. On top of it the book tracks logical ledgers so each side can only
+    // ever spend its own funds:
+    //   • traderCollateral[side][t] — per-side trader margin (already exists from T4)
+    //   • totalCollateral           — running Σ of ALL traderCollateral (both sides)
+    //   • putEscrow                 — pool USDC locked as qty·W escrow vs open puts
+    // Derived: poolFree() = poolUsdc − totalCollateral − putEscrow (the pool's own
+    // uncommitted USDC). Conservation invariant (T7 fuzzes this):
+    //   vault.poolUsdc() == poolFree() + putEscrow + totalCollateral, always.
+
+    /// @notice Pool USDC locked as escrow against open PUT positions (6dp).
+    /// @dev PUT uses the slice-2 fully-collateralized escrow model: each open put locks
+    ///      qty·Wput of the pool's own USDC until close. Released FIRST on close (F2).
+    uint256 public putEscrow;
+
+    /// @notice Running sum of ALL traderCollateral across BOTH sides (6dp).
+    /// @dev Maintained incrementally on every collateral mutation so poolFree() stays O(1).
+    uint256 public totalCollateral;
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     event Deposited(Side indexed side, address indexed trader, uint256 amt);
@@ -124,6 +145,14 @@ contract EverlastingBook {
         return vault.poolUsdc();
     }
 
+    /// @notice The pool's own uncommitted USDC (6dp): physical pool minus all trader
+    ///         collateral claims minus put escrow.
+    /// @dev Reverts on underflow — and that underflow is precisely the solvency-invariant
+    ///      violation Task 7 fuzzes against (poolUsdc must always cover collateral + escrow).
+    function poolFree() public view returns (uint256) {
+        return vault.poolUsdc() - totalCollateral - putEscrow;
+    }
+
     // ── Intrinsic ─────────────────────────────────────────────────────────────
 
     /// @notice Intrinsic value for the given side (WAD).
@@ -156,17 +185,40 @@ contract EverlastingBook {
     function deposit(Side side, uint256 amt) external {
         vault.pullUsdc(msg.sender, amt);
         traderCollateral[uint8(side)][msg.sender] += amt;
+        totalCollateral += amt; // T6: keep Σ collateral in lockstep (poolFree stays flat here)
         emit Deposited(side, msg.sender, amt);
     }
 
     // ── openLong ──────────────────────────────────────────────────────────────
 
     /// @notice Open a long position on the given side.
-    /// @dev PUT: temporary placeholder — T6 implements.
+    /// @dev PUT (slice-2 escrow model): fresh mark, one position per (side, trader),
+    ///      escrow IM = qty·Wput of the trader's collateral, and the pool locks a matching
+    ///      qty·Wput of its OWN free USDC as escrow (fully collateralized). Cap on open qty.
     ///      COVERED_CALL: fresh mark required, one position per (side, trader), premium IM check,
     ///      D3 cover gate reads vault.coverHype() on-chain (not optimistic local state), cap check.
     function openLong(Side side, uint256 qty) external {
-        if (side == Side.PUT) revert("put: enabled in T6");
+        if (side == Side.PUT) {
+            // ── PUT branch (port of EverlastingMarket.openLong) ──────────────
+            uint8 sp = uint8(Side.PUT);
+            SideState storage ps = sideState[sp];
+            require(qty > 0, "qty=0");
+            require(ps.mark > 0, "no mark");
+            require(block.timestamp <= ps.lastMarkTime + MAX_MARK_AGE, "stale mark");
+            require(positions[sp][msg.sender].qty == 0, "one position");
+
+            uint256 im = _toUsdc(qty * Wput / 1e18);                // escrow IM = qty·W
+            require(traderCollateral[sp][msg.sender] >= im, "put: IM");
+            require(poolFree() >= im, "put: pool escrow");          // pool can lock qty·W
+
+            putEscrow += im;
+            ps.netWritten += qty;
+            require(ps.netWritten <= putCapNotional, "cap");        // WAD cap on open put qty
+
+            positions[sp][msg.sender] = Position(qty, ps.mark, ps.cumFunding);
+            emit Opened(Side.PUT, msg.sender, qty, ps.mark);
+            return;
+        }
 
         // COVERED_CALL branch
         SideState storage ss = sideState[uint8(side)];
@@ -190,17 +242,21 @@ contract EverlastingBook {
     // ── postMark ──────────────────────────────────────────────────────────────
 
     /// @notice Keeper posts a new mark price for the given side.
-    /// @dev PUT: temporary placeholder — T6 implements.
+    /// @dev PUT: keeper-gated, ≤Wput upper clamp (slice-2 payout cap), deviation +
+    ///      recoverable-staleness guards, F3 funding advance using contemporaneous lastIntrinsic.
     ///      COVERED_CALL: keeper-gated, uncapped (no ≤W), deviation + recoverable-staleness guards,
     ///      F3 funding advance using contemporaneous lastIntrinsic.
+    ///      The deviation/staleness/funding block below is shared and behaviourally identical for
+    ///      both sides; the ONLY per-side difference is the PUT ≤Wput clamp.
     function postMark(Side side, uint256 newMark) external {
         require(msg.sender == keeper, "only keeper");
-        if (side == Side.PUT) revert("put: enabled in T6");
 
-        // COVERED_CALL branch
         SideState storage ss = sideState[uint8(side)];
         uint256 intr = intrinsic(side);
         require(newMark >= intr, "mark<intrinsic");
+        if (side == Side.PUT) {
+            require(newMark <= Wput, "mark>W"); // PUT-side payout clamp (slice-2); call side uncapped
+        }
 
         bool isFresh = (ss.mark != 0) && (block.timestamp <= ss.lastMarkTime + MAX_MARK_AGE);
         if (isFresh) {
@@ -238,9 +294,9 @@ contract EverlastingBook {
     /// @notice Trader's net loss in USDC for the given side (6dp). Zero when net gain.
     ///         The I2 insolvency predicate: settle fires when netLossUsdc > traderCollateral.
     ///         Mirrors CoveredCallMarket.netLossUsdc, parameterised by side.
-    /// @dev    PUT: placeholder — T6 implements.
+    /// @dev    Side-agnostic: the long-option PnL split (markGain/markLoss less funding) is
+    ///         identical for PUT and COVERED_CALL, so this powers settle() on both sides (T6).
     function netLossUsdc(Side side, address t) public view returns (uint256) {
-        if (side == Side.PUT) revert("put: enabled in T6");
         uint8 s = uint8(side);
         Position memory p = positions[s][t];
         if (p.qty == 0) return 0;
@@ -309,8 +365,9 @@ contract EverlastingBook {
             }
             // Source payout from physical vault balance (M3 safety — never from sellCover return)
             require(vault.poolUsdc() >= g, "pool");
-            // Credit trader; pool free (= poolUsdc − Σ traderCollateral) decreases by g
+            // Credit trader; pool free (= poolUsdc − totalCollateral − putEscrow) decreases by g
             traderCollateral[s][t] += g;
+            totalCollateral += g; // T6: keep Σ collateral in lockstep
             ss.netWritten -= p.qty;
             delete positions[s][t];
             // forge-lint: disable-next-line(unsafe-typecast)
@@ -320,6 +377,7 @@ contract EverlastingBook {
             uint256 l = markLossU + fundingU - markGainU;
             if (l > traderCollateral[s][t]) l = traderCollateral[s][t]; // auto-settle floor
             traderCollateral[s][t] -= l;
+            totalCollateral -= l; // T6: keep Σ collateral in lockstep
             // l implicitly accrues to pool free (poolUsdc unchanged; Σ traderCollateral drops)
             ss.netWritten -= p.qty;
             delete positions[s][t];
@@ -328,20 +386,81 @@ contract EverlastingBook {
         }
     }
 
+    /// @dev Internal: close a PUT position for trader `t` (port of EverlastingMarket._closeFor).
+    ///
+    ///      F2 (escrow-release-FIRST, no-false-revert): the put's qty·W escrow is released back to
+    ///      poolFree BEFORE the payout is credited. Because any winning payout g is bounded by
+    ///      qty·(mark−entryMark) ≤ qty·W = escrow (mark ≤ Wput is enforced at postMark), releasing
+    ///      first guarantees poolFree ≥ g — the credit can never underflow poolFree / false-revert.
+    ///
+    ///      Shared pool: no vault cash moves on a put close. Only the logical ledgers rebalance —
+    ///      putEscrow drops by the escrow, and (gain) collateral rises / poolFree falls by g, or
+    ///      (loss) collateral falls / poolFree rises by l. Conservation holds by construction.
+    ///
+    ///      No int256 intermediate: gain/loss split kept in uint256; precision favours the pool.
+    function _closePut(address t) internal {
+        uint8 s = uint8(Side.PUT);
+        SideState storage ss = sideState[s];
+        Position memory p = positions[s][t];
+        require(p.qty > 0, "no position");
+
+        uint256 fundingU = _toUsdc(p.qty * (ss.cumFunding - p.entryCumFunding) / 1e18);
+
+        // Mark PnL split in uint256 — avoids int256 intermediate (mirrors _closeFor)
+        uint256 markGainU;
+        uint256 markLossU;
+        if (ss.mark >= p.entryMark) {
+            markGainU = _toUsdc(p.qty * (ss.mark - p.entryMark) / 1e18);
+        } else {
+            markLossU = _toUsdc(p.qty * (p.entryMark - ss.mark) / 1e18);
+        }
+
+        // F2: release THIS put's escrow FIRST, so poolFree ≥ escrow ≥ g and the payout can't false-revert.
+        uint256 escrow = _toUsdc(p.qty * Wput / 1e18);
+        putEscrow -= escrow;
+
+        if (markGainU >= markLossU + fundingU) {
+            // ── Gain branch: trader net g (g ≤ markGainU ≤ escrow) ────────────
+            uint256 g = markGainU - markLossU - fundingU;
+            // Pool covers g from the just-released escrow; poolFree nets +escrow−g ≥ 0.
+            traderCollateral[s][t] += g;
+            totalCollateral += g;
+            ss.netWritten -= p.qty;
+            delete positions[s][t];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            emit Closed(t, int256(g), 0);
+        } else {
+            // ── Loss branch: trader net −l, floored at collateral (auto-settle) ─
+            uint256 l = markLossU + fundingU - markGainU;
+            if (l > traderCollateral[s][t]) l = traderCollateral[s][t]; // auto-settle floor
+            traderCollateral[s][t] -= l;
+            totalCollateral -= l;
+            // l accrues to poolFree; released escrow returns to poolFree too.
+            ss.netWritten -= p.qty;
+            delete positions[s][t];
+            // forge-lint: disable-next-line(unsafe-typecast)
+            emit Closed(t, -int256(l), 0);
+        }
+    }
+
     /// @notice Close msg.sender's position on the given side.
-    /// @dev    PUT: placeholder — T6 implements.
     function close(Side side) external {
-        if (side == Side.PUT) revert("put: enabled in T6");
+        if (side == Side.PUT) {
+            _closePut(msg.sender);
+            return;
+        }
         _closeCall(msg.sender);
     }
 
     /// @notice Permissionless force-close when the position's net loss exceeds collateral (I2).
     ///         Anyone may call this once a position is insolvent; keeper may call during mark updates.
-    /// @dev    PUT: placeholder — T6 implements.
     function settle(Side side, address t) external {
-        if (side == Side.PUT) revert("put: enabled in T6");
         require(positions[uint8(side)][t].qty > 0, "no position");
         require(netLossUsdc(side, t) > traderCollateral[uint8(side)][t], "solvent");
+        if (side == Side.PUT) {
+            _closePut(t);
+            return;
+        }
         _closeCall(t);
     }
 }

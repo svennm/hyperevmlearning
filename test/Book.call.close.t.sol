@@ -65,13 +65,15 @@ contract BookCallCloseTest is Test {
 
     // ── PUT placeholder reverts ───────────────────────────────────────────────
 
-    function test_close_put_reverts_placeholder() public {
-        vm.expectRevert(bytes("put: enabled in T6"));
+    /// @dev PUT is enabled (T6). With no PUT position, close(PUT) hits the no-position guard.
+    function test_close_put_reverts_no_position() public {
+        vm.expectRevert(bytes("no position"));
         book.close(PUT);
     }
 
-    function test_settle_put_reverts_placeholder() public {
-        vm.expectRevert(bytes("put: enabled in T6"));
+    /// @dev PUT is enabled (T6). With no PUT position, settle(PUT) hits the no-position guard.
+    function test_settle_put_reverts_no_position() public {
+        vm.expectRevert(bytes("no position"));
         book.settle(PUT, address(this));
     }
 
