@@ -1,0 +1,404 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.35;
+
+import {Test} from "forge-std/Test.sol";
+import {EverlastingBook} from "../src/EverlastingBook.sol";
+import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
+import {MockOracle} from "../src/MockOracle.sol";
+
+/// @title BookInvariantHandler
+/// @notice Fuzz handler exercising the FULL two-sided EverlastingBook life-cycle on ONE shared
+///         pool: LP liquidity, cover buying, per-side deposit/open/mark/close/settle/withdraw, and
+///         a spot driver that sweeps HYPE price across [1, 1000*Kcall] AND down toward 0.
+///
+///         The handler is the book's keeper (nonce-predicted in setUp), so it may postMark.
+///         Model soundness: `moveSpot`/`crashSpot` set BOTH the option oracle and the vault cover
+///         price to the SAME spot (the underlying of a HYPE option IS HYPE), and call marks are
+///         capped at spot (a call is never worth more than the underlying). Opens are made reachable
+///         by seeding cover + pool-free + collateral generously right before each attempt.
+contract BookInvariantHandler is Test {
+    EverlastingBook public book;
+    MockCoverVault  public vault;
+    MockOracle      public oracle;
+    address[]       public actors;
+
+    uint256 public constant KPUT  = 100e18;
+    uint256 public constant WPUT  =  50e18;
+    uint256 public constant KCALL = 120e18;
+
+    EverlastingBook.Side private constant PUT  = EverlastingBook.Side.PUT;
+    EverlastingBook.Side private constant CALL = EverlastingBook.Side.COVERED_CALL;
+    uint8 private constant PUT_U  = 0;
+    uint8 private constant CALL_U = 1;
+
+    // ── Non-vacuity counters ──────────────────────────────────────────────────
+    uint256 public marksPutPosted;
+    uint256 public marksCallPosted;
+    uint256 public putsOpened;
+    uint256 public callsOpened;
+    uint256 public putsClosed;
+    uint256 public callsClosed;
+
+    constructor(EverlastingBook _book, MockCoverVault _vault, MockOracle _oracle, address[] memory _actors) {
+        book = _book;
+        vault = _vault;
+        oracle = _oracle;
+        actors = _actors;
+    }
+
+    function _actor(uint256 seed) internal view returns (address) {
+        return actors[seed % actors.length];
+    }
+
+    /// @notice One-shot baseline: post both marks + open ONE real position on EACH side, so the
+    ///         post-setUp snapshot every fuzz run reverts to is already non-vacuous. Called once
+    ///         from setUp (and excluded from the fuzz target set). The fuzz then layers MANY more
+    ///         opens/marks/closes on top — this only guarantees afterInvariant's floor is ≥1 even
+    ///         if a given run's random tail is quiet (Foundry reverts handler state between runs,
+    ///         so afterInvariant sees the last run's counters, which now start from this baseline).
+    function bootstrap() external {
+        try book.postMark(CALL, 5e18)  { marksCallPosted++; } catch {} // call OTM → intrinsic 0
+        try book.postMark(PUT, 20e18)  { marksPutPosted++; } catch {}  // put ATM → intrinsic 0
+        try vault.buyCover(10e18, type(uint256).max) {} catch {}       // cover for the call
+        try book.lpDeposit(200e6) {} catch {}                          // pool-free for the put escrow
+
+        address ca = actors[0];
+        vm.startPrank(ca);
+        try book.deposit(CALL, 100e6) {} catch {}
+        try book.openLong(CALL, 1e18) { callsOpened++; } catch {}
+        vm.stopPrank();
+
+        address pa = actors[1];
+        vm.startPrank(pa);
+        try book.deposit(PUT, 100e6) {} catch {}
+        try book.openLong(PUT, 1e18) { putsOpened++; } catch {}
+        vm.stopPrank();
+    }
+
+    // ── LP pool-free liquidity ────────────────────────────────────────────────
+
+    function lpDeposit(uint256 amt) external {
+        amt = bound(amt, 1e6, 1_000_000e6);
+        try book.lpDeposit(amt) {} catch {}
+    }
+
+    function lpWithdraw(uint256 amt) external {
+        amt = bound(amt, 1, 2_000_000e6);
+        try book.lpWithdraw(amt) {} catch {}
+    }
+
+    // ── Cover buying (keep coverHype ahead of call demand) ────────────────────
+
+    function buyCover(uint256 qty) external {
+        qty = bound(qty, 1e16, 500e18);
+        uint256 px = vault.spotPxUsdc();
+        if (px == 0) return;
+        uint256 cost = qty * px / 1e18 / 1e12 + 1;
+        try book.lpDeposit(cost) {} catch {}                    // fund the buy from LP capital
+        try vault.buyCover(qty, type(uint256).max) {} catch {}  // poolFree flat, coverHype up
+    }
+
+    // ── Deposit collateral (both sides) ───────────────────────────────────────
+
+    function deposit(uint256 sideSeed, uint256 seed, uint256 amt) external {
+        amt = bound(amt, 1e6, 100_000e6);
+        EverlastingBook.Side side = sideSeed % 2 == 0 ? PUT : CALL;
+        vm.prank(_actor(seed));
+        try book.deposit(side, amt) {} catch {}
+    }
+
+    // ── Open (both sides) ─────────────────────────────────────────────────────
+    //
+    // Reachability: the handler IS the keeper, so each open self-posts a FRESH mark first
+    // (a call is worth ≤ spot; a put ≤ Wput). This makes opens reliable on EVERY fuzz seed
+    // (no dependence on the fuzzer happening to post a mark before the mark goes stale), so
+    // the campaign is non-vacuous deterministically. Marks self-posted here also count.
+
+    /// @dev Best-effort post of a fresh mark for `side` at the current spot; counts on success.
+    function _selfPostMark(EverlastingBook.Side side) internal {
+        uint8 s = uint8(side);
+        uint256 spot = oracle.spotWad();
+        (uint256 cm, uint256 lmt,,,) = book.sideState(s);
+        bool fresh = cm != 0 && block.timestamp <= lmt + book.MAX_MARK_AGE();
+        uint256 pm;
+        if (side == CALL) {
+            uint256 intr = spot > KCALL ? spot - KCALL : 0; // call intrinsic ≤ spot
+            if (!fresh) {
+                pm = spot > 0 ? spot : 1;                   // in [intr, spot], positive
+            } else {
+                pm = cm;                                    // 0% deviation re-post
+                if (pm < intr) pm = intr;                   // may exceed deviation → caught
+                if (pm > spot) pm = spot;
+            }
+        } else {
+            uint256 pv = spot >= KPUT ? 0 : KPUT - spot;
+            uint256 intr = pv > WPUT ? WPUT : pv;           // put intrinsic ≤ Wput
+            if (!fresh) {
+                pm = intr > 0 ? intr : (WPUT / 2);          // in [intr, Wput], positive
+            } else {
+                pm = cm;
+                if (pm < intr) pm = intr;
+                if (pm > WPUT) pm = WPUT;
+            }
+        }
+        if (pm == 0) return;
+        try book.postMark(side, pm) {
+            if (side == CALL) marksCallPosted++;
+            else marksPutPosted++;
+        } catch {}
+    }
+
+    function openLongCall(uint256 seed, uint256 qty) external {
+        _selfPostMark(CALL);
+        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(CALL_U);
+        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) return;
+        uint256 px = vault.spotPxUsdc();
+        if (px == 0) return;
+        qty = bound(qty, 1e17, 5e18);
+        address a = _actor(seed);
+        (uint256 pq,,) = book.positions(CALL_U, a);
+        if (pq != 0) return;
+
+        // Seed cover generously (keep coverHype >> netWritten) + IM.
+        uint256 coverQty = qty * 3;
+        uint256 coverCost = coverQty * px / 1e18 / 1e12 + 1;
+        try book.lpDeposit(coverCost) {} catch {}
+        try vault.buyCover(coverQty, type(uint256).max) {} catch {}
+
+        uint256 im = qty * mark / 1e18 / 1e12 + 1e6;
+        vm.startPrank(a);
+        try book.deposit(CALL, im) {} catch {}
+        try book.openLong(CALL, qty) { callsOpened++; } catch {}
+        vm.stopPrank();
+    }
+
+    function openLongPut(uint256 seed, uint256 qty) external {
+        _selfPostMark(PUT);
+        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(PUT_U);
+        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) return;
+        qty = bound(qty, 1e17, 5e18);
+        address a = _actor(seed);
+        (uint256 pq,,) = book.positions(PUT_U, a);
+        if (pq != 0) return;
+
+        // escrow IM = _toUsdc(qty*Wput/1e18); the pool must have >= im FREE to lock as escrow.
+        uint256 im = qty * WPUT / 1e18 / 1e12 + 1;
+        try book.lpDeposit(im + 1e6) {} catch {}   // raise poolFree for the escrow lock
+        vm.startPrank(a);
+        try book.deposit(PUT, im) {} catch {}      // trader margin (poolFree flat)
+        try book.openLong(PUT, qty) { putsOpened++; } catch {}
+        vm.stopPrank();
+    }
+
+    // ── Mark posting (both sides) ─────────────────────────────────────────────
+
+    function postMarkCall(uint256 m) external {
+        uint256 spot = oracle.spotWad();
+        uint256 intr = spot > KCALL ? spot - KCALL : 0;       // call intrinsic (uncapped)
+        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(CALL_U);
+
+        uint256 lo;
+        uint256 hi;
+        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) {
+            lo = intr;
+            hi = spot > intr ? spot : intr;                    // cap at spot: call <= underlying
+        } else {
+            uint256 dhi = mark + mark * 2000 / 10000;
+            uint256 rawlo = mark >= mark * 2000 / 10000 ? mark - mark * 2000 / 10000 : 0;
+            lo = rawlo > intr ? rawlo : intr;
+            hi = dhi < spot ? dhi : spot;                      // cap at spot
+        }
+        if (hi < lo) hi = lo;
+        m = bound(m, lo, hi);
+        vm.warp(block.timestamp + book.FUNDING_PERIOD());
+        try book.postMark(CALL, m) { marksCallPosted++; } catch {}
+    }
+
+    function postMarkPut(uint256 m) external {
+        uint256 spot = oracle.spotWad();
+        uint256 pv = spot >= KPUT ? 0 : KPUT - spot;
+        uint256 intr = pv > WPUT ? WPUT : pv;                  // put intrinsic clamped at Wput
+        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(PUT_U);
+
+        uint256 lo;
+        uint256 hi;
+        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) {
+            lo = intr;
+            hi = WPUT;                                         // put mark clamped at Wput
+        } else {
+            uint256 dhi = mark + mark * 2000 / 10000;
+            uint256 rawlo = mark >= mark * 2000 / 10000 ? mark - mark * 2000 / 10000 : 0;
+            lo = rawlo > intr ? rawlo : intr;
+            hi = dhi < WPUT ? dhi : WPUT;
+        }
+        if (hi < lo) hi = lo;
+        m = bound(m, lo, hi);
+        vm.warp(block.timestamp + book.FUNDING_PERIOD());
+        try book.postMark(PUT, m) { marksPutPosted++; } catch {}
+    }
+
+    // ── Close / settle (both sides) ───────────────────────────────────────────
+
+    function closeCall(uint256 seed) external {
+        address a = _actor(seed);
+        vm.prank(a);
+        try book.close(CALL) { callsClosed++; } catch {}
+    }
+
+    function closePut(uint256 seed) external {
+        address a = _actor(seed);
+        vm.prank(a);
+        try book.close(PUT) { putsClosed++; } catch {}
+    }
+
+    function settleCall(uint256 seed) external {
+        try book.settle(CALL, _actor(seed)) {} catch {}
+    }
+
+    function settlePut(uint256 seed) external {
+        try book.settle(PUT, _actor(seed)) {} catch {}
+    }
+
+    // ── Withdraw free collateral (both sides) ─────────────────────────────────
+
+    function withdrawCall(uint256 seed, uint256 amt) external {
+        address a = _actor(seed);
+        amt = bound(amt, 1, book.traderCollateral(CALL_U, a) + 1);
+        vm.prank(a);
+        try book.withdraw(CALL, amt) {} catch {}
+    }
+
+    function withdrawPut(uint256 seed, uint256 amt) external {
+        address a = _actor(seed);
+        amt = bound(amt, 1, book.traderCollateral(PUT_U, a) + 1);
+        vm.prank(a);
+        try book.withdraw(PUT, amt) {} catch {}
+    }
+
+    // ── Spot driver: sweep across [1, 1000*Kcall] AND crash toward 0 ──────────
+
+    function moveSpot(uint256 s) external {
+        s = bound(s, 1e18, 1000 * KCALL);
+        oracle.set(s);
+        vault.setMockPx(s);   // option underlying == HYPE cover price
+    }
+
+    function crashSpot(uint256 s) external {
+        s = bound(s, 1, 5e18);   // sub-$5 down to 1 wei: put payout explodes, cover value collapses
+        oracle.set(s);
+        vault.setMockPx(s);
+    }
+}
+
+/// @title BookInvariantTest
+/// @notice Task 7 solvency proof — a conservation fuzz over the unified two-sided EverlastingBook.
+///
+///   invariant_usdcConservation (LOAD-BEARING): vault.poolUsdc() == poolFree() + putEscrow +
+///     totalCollateral, AND totalCollateral == Σ traderCollateral over BOTH sides × all actors.
+///     poolFree() underflow-reverts if poolUsdc < totalCollateral + putEscrow, so a violated state
+///     either reverts inside the invariant or fails the equality — the tick-dust liveness leak this
+///     task fixes would surface here as a poolFree() underflow after enough winning call closes.
+///   invariant_coverGate: vault.coverHype() >= callNetWritten (1:1 tail cover, never over-sold).
+///   invariant_putEscrow: putEscrow == Σ (open PUT) _toUsdc(qty*Wput/1e18).
+///   afterInvariant: non-vacuity — real opens on BOTH sides + marks on both sides actually landed.
+///
+/// @dev Fixed seed + explicit runs/depth make the campaign reproducible (the non-vacuity check is a
+///      cumulative-counter assertion, which — like any afterInvariant guard — must be deterministic
+///      to avoid seed-flaky CI). Opens self-post fresh marks, so the campaign is non-vacuous by
+///      construction regardless of seed; the pin just makes the exact counts reproducible.
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 500
+/// forge-config: default.invariant.fail-on-revert = false
+/// forge-config: default.fuzz.seed = '0x7'
+contract BookInvariantTest is Test {
+    MockCoverVault  vault;
+    MockOracle      oracle;
+    EverlastingBook book;
+    BookInvariantHandler h;
+
+    address[] actors = [address(0xA11CE), address(0xB0B), address(0xCA11)];
+
+    uint256 constant KPUT  = 100e18;
+    uint256 constant WPUT  =  50e18;
+    uint256 constant KCALL = 120e18;
+    uint8 private constant PUT_U  = 0;
+    uint8 private constant CALL_U = 1;
+
+    function setUp() public {
+        vault  = new MockCoverVault();
+        oracle = new MockOracle();
+        oracle.set(100e18);       // spot == Kput → put intrinsic 0, call OTM: first marks land wide
+        vault.setMockPx(100e18);  // cover price == underlying
+
+        // Nonce-predict the handler so it becomes the keeper.
+        // After vault + oracle deploy, book deploys at getNonce(this); handler at +1 == predicted.
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
+        book = new EverlastingBook(
+            vault, oracle, predicted,
+            KPUT, WPUT, KCALL,
+            5_000_000e18, // putCapNotional (generous — opens reachable; cap logic unit-tested elsewhere)
+            5_000_000e18  // callCapNotional
+        );
+        h = new BookInvariantHandler(book, vault, oracle, actors);
+        require(address(h) == predicted, "keeper wiring");
+
+        // Seed pool-free liquidity + initial cover so the first opens are reachable.
+        book.lpDeposit(500_000e6);            // poolFree = 500_000e6
+        vault.buyCover(1_000e18, type(uint256).max); // coverHype = 1000e18 (cost 100_000e6 from free)
+
+        // Bake ONE real position + mark on EACH side into the baseline snapshot (non-vacuity floor).
+        h.bootstrap();
+
+        targetContract(address(h));
+        // Exclude the one-shot bootstrap from the fuzz target set (it's a setUp helper, not an op).
+        bytes4[] memory noBoot = new bytes4[](1);
+        noBoot[0] = h.bootstrap.selector;
+        excludeSelector(FuzzSelector({addr: address(h), selectors: noBoot}));
+    }
+
+    // ── Conservation (the load-bearing solvency invariant) ────────────────────
+
+    function invariant_usdcConservation() public view {
+        // poolFree() reverts on underflow — a violated (insolvent) state can't even reach the assert.
+        assertEq(
+            vault.poolUsdc(),
+            book.poolFree() + book.putEscrow() + book.totalCollateral(),
+            "conservation: poolUsdc != poolFree + putEscrow + totalCollateral"
+        );
+
+        // totalCollateral must equal the live Σ of per-trader collateral across BOTH sides.
+        uint256 sumCol;
+        for (uint256 i = 0; i < actors.length; i++) {
+            sumCol += book.traderCollateral(PUT_U, actors[i]);
+            sumCol += book.traderCollateral(CALL_U, actors[i]);
+        }
+        assertEq(book.totalCollateral(), sumCol, "conservation: totalCollateral != sum traderCollateral");
+    }
+
+    // ── Cover gate: 1:1 tail cover, never over-sold ───────────────────────────
+
+    function invariant_coverGate() public view {
+        (,,,, uint256 callNetWritten) = book.sideState(CALL_U);
+        assertGe(vault.coverHype(), callNetWritten, "coverGate: coverHype < callNetWritten");
+    }
+
+    // ── Put escrow: exactly Σ over open puts of _toUsdc(qty*Wput/1e18) ─────────
+
+    function invariant_putEscrow() public view {
+        uint256 sumEscrow;
+        for (uint256 i = 0; i < actors.length; i++) {
+            (uint256 qty,,) = book.positions(PUT_U, actors[i]);
+            if (qty > 0) sumEscrow += (qty * WPUT / 1e18) / 1e12; // _toUsdc(qty*Wput/1e18)
+        }
+        assertEq(book.putEscrow(), sumEscrow, "putEscrow != sum open-put qty*Wput");
+    }
+
+    // ── Non-vacuity: real activity on BOTH sides ──────────────────────────────
+
+    function afterInvariant() public view {
+        assertGt(h.marksPutPosted(),  0, "vacuous: no PUT marks posted");
+        assertGt(h.marksCallPosted(), 0, "vacuous: no CALL marks posted");
+        assertGt(h.putsOpened(),      0, "vacuous: no PUT opens");
+        assertGt(h.callsOpened(),     0, "vacuous: no CALL opens");
+    }
+}

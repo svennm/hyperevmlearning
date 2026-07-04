@@ -127,22 +127,31 @@ contract BookCallCloseTest is Test {
         // Correct: poolAfter = 40_011e6. Double-credit bug: poolAfter = 40_012e6.
         assertEq(poolAfter, poolBefore + 1e6, "pool += usdcFromSell only (no double-credit)");
 
-        // Conservation identity: poolUsdc == pool-free + Σ traderCollateral
-        // (always true algebraically, but verifies no phantom pool mutation)
-        uint256 poolFree = poolAfter - traderCol;
-        assertEq(poolFree + traderCol, poolAfter, "conservation: poolUsdc == pool-free + collateral");
+        // Conservation identity against the contract's OWN ledgers (not a tautology): the physical
+        // pool balance must equal poolFree() + putEscrow + totalCollateral, and totalCollateral must
+        // equal the live sum of per-trader collateral. A phantom pool mutation or a Σ drift breaks this.
+        assertEq(
+            poolAfter,
+            book.poolFree() + book.putEscrow() + book.totalCollateral(),
+            "conservation: poolUsdc == poolFree + putEscrow + totalCollateral"
+        );
+        assertEq(book.totalCollateral(), traderCol, "totalCollateral == sum traderCollateral (single actor)");
     }
 
-    // ── Winning close: dust tolerance (flooredHype=0) ─────────────────────────
+    // ── Winning close: sub-tick gain rounds UP to one tick (T7 tick-dust fix) ──
 
-    /// @dev When the gain is below 0.01 HYPE at current spot, flooredHype=0 → no sellCover.
-    ///      Payout is sourced from the existing vault.poolUsdc() balance (M3 path still valid).
+    /// @dev T7 tick-dust fix: a gain worth LESS than 0.01 HYPE at current spot now sells exactly
+    ///      ONE tick (ceil-to-tick), NOT zero (the old floor). Proceeds P ≥ g, so poolFree() is
+    ///      replenished and NEVER eroded — the pool keeps the sub-tick excess (P − g) as FREE USDC.
+    ///      The old floor-to-0 path left the gain unfunded by cover and slowly bled poolFree().
     ///
     ///      Setup: close the setUp position (neutral, g=0), then open 0.1 HYPE.
     ///      Mark 5→6: g = _toUsdc(0.1e18*(6-5)/1e18) = 1e5 USDC.
-    ///      hypeForG = (1e5*1e12)*1e18/100e18 = 1e15 WAD < 0.01 HYPE (1e16 WAD) → floored to 0.
-    function test_winning_close_sub_tick_dust_no_cover_sold() public {
-        // Neutral-close the setUp position (mark unchanged → g=0, l=0)
+    ///      hypeForG = (1e5*1e12)*1e18/100e18 = 1e15 WAD < 0.01 HYPE (1e16 WAD) → ceils UP to 1e16.
+    ///      sellCover(1e16) → coverHype -= 1e16, poolUsdc += P = _toUsdc(1e16*100e18/1e18) = 1e6.
+    ///      Trader is credited g = 1e5; the pool keeps P − g = 9e5 as pool-free USDC.
+    function test_winning_close_sub_tick_gain_rounds_up_one_tick() public {
+        // Neutral-close the setUp position (mark unchanged → g=0, l=0). g=0 → NO cover sold.
         book.close(CALL);
         assertEq(book.traderCollateral(CALL_U, address(this)), 10e6, "neutral close: collateral unchanged");
 
@@ -153,14 +162,24 @@ contract BookCallCloseTest is Test {
         vm.warp(2);
         book.postMark(CALL, 6e18);
 
-        uint256 coverBefore = vault.coverHype();
+        uint256 coverBefore    = vault.coverHype();   // 100e18
+        uint256 poolBefore     = vault.poolUsdc();    // 40_012e6
+        uint256 totalColBefore = book.totalCollateral();
 
         book.close(CALL);
 
-        // g = 1e5 USDC; hypeForG = 1e15 WAD; flooredHype = 0 → no sellCover
-        assertEq(vault.coverHype(), coverBefore, "no cover sold (sub-tick dust)");
-        // Trader still paid g = 1e5 from pool's existing balance
-        assertEq(book.traderCollateral(CALL_U, address(this)), 12e6 + 1e5, "trader paid g=1e5 without cover sale");
+        // g = 1e5 USDC; hypeForG = 1e15 WAD; ceilHype = 1e16 (exactly one tick) → sellCover(1e16)
+        assertEq(vault.coverHype(), coverBefore - 1e16, "sub-tick gain sells exactly one tick");
+        // Proceeds P = 1e6 credited to the pool; trader paid only g = 1e5
+        assertEq(vault.poolUsdc(), poolBefore + 1e6, "poolUsdc += P (1e6 proceeds)");
+        assertEq(book.traderCollateral(CALL_U, address(this)), 12e6 + 1e5, "trader paid g=1e5");
+        // poolFree() GREW by P − g = 9e5 (never eroded): ΔpoolUsdc(+1e6) − ΔtotalCollateral(+1e5)
+        assertEq(book.totalCollateral(), totalColBefore + 1e5, "totalCollateral += g only");
+        assertEq(
+            vault.poolUsdc(),
+            book.poolFree() + book.putEscrow() + book.totalCollateral(),
+            "conservation holds after ceil-to-tick close"
+        );
     }
 
     // ── Losing close ──────────────────────────────────────────────────────────

@@ -108,6 +108,12 @@ contract EverlastingBook {
     /// @notice Emitted on every close and settle.
     /// @param coverSold  HYPE WAD sold from cover to fund a winning payout (0 on loss branch).
     event Closed(address indexed trader, int256 net, uint256 coverSold);
+    /// @notice Emitted when a trader withdraws free (position-closed) collateral out of the pool.
+    event Withdrawn(Side indexed side, address indexed trader, uint256 amt);
+    /// @notice Emitted when an LP deposits its OWN capital into pool-free USDC (raises poolFree).
+    event LpDeposited(address indexed lp, uint256 amt);
+    /// @notice Emitted when an LP withdraws pool-free USDC (lowers poolFree).
+    event LpWithdrawn(address indexed lp, uint256 amt);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -347,31 +353,51 @@ contract EverlastingBook {
             markLossU = _toUsdc(p.qty * (p.entryMark - ss.mark) / 1e18);
         }
 
-        uint256 flooredHype; // set in gain branch; stays 0 on loss branch
+        uint256 coverSoldHype; // set in gain branch; stays 0 on loss branch
 
         if (markGainU >= markLossU + fundingU) {
             // ── Gain branch ──────────────────────────────────────────────────
             uint256 g = markGainU - markLossU - fundingU;
-            // I3: fund g by selling cover
-            uint256 spotPxWad = vault.spotPxUsdc();            // WAD USDC per HYPE
-            // g (6dp) → WAD → divide by spot → HYPE WAD
-            uint256 hypeForG = (g * 1e12) * 1e18 / spotPxWad;
-            // forge-lint: disable-next-line(divide-before-multiply) -- intentional szDecimals floor
-            flooredHype = (hypeForG / 1e16) * 1e16;            // tick = 0.01 HYPE = 1e16 WAD
-            if (flooredHype > 0 && flooredHype <= vault.coverHype()) {
-                // M3: do NOT read the return value — sellCover's return is an estimate.
-                // MockCoverVault credits poolUsdc synchronously; CoreCoverVault is async (T9).
-                vault.sellCover(flooredHype);
+            if (g > 0) {
+                // I3: realize g by selling cover HYPE → USDC into the pool.
+                uint256 spotPxWad = vault.spotPxUsdc();        // WAD USDC per HYPE
+                // g (6dp) → WAD → divide by spot → HYPE WAD needed to raise exactly g.
+                uint256 hypeForG = (g * 1e12) * 1e18 / spotPxWad;
+                // T7 tick-dust fix: CEIL to the szDecimals=2 tick (NOT floor). Flooring retained the
+                // sub-tick HYPE as cover dust while the payout debited a full g, eroding poolFree() by
+                // (g − proceeds) < 1 tick on every winning close — a slow LIVENESS leak a long fuzz
+                // drives to underflow-revert. Ceiling sells one extra sub-tick so proceeds P ≥ g and
+                // the pool keeps the excess as FREE USDC; poolFree() is never eroded. Value conserved.
+                // forge-lint: disable-next-line(divide-before-multiply) -- intentional ceil-to-tick
+                uint256 sellHype = ((hypeForG + 1e16 - 1) / 1e16) * 1e16; // tick = 0.01 HYPE = 1e16 WAD
+                // coverGate guard: never sell cover still backing OTHER open calls. Cap the sale at
+                // the surplus over netWritten_after (= ss.netWritten − p.qty), so coverHype − sellHype
+                // ≥ netWritten_after and `coverHype ≥ callNetWritten` is preserved. coverGate holds
+                // pre-close ⇒ coverHype ≥ ss.netWritten ≥ ss.netWritten − p.qty, so maxSell ≥ p.qty ≥ 0
+                // (no underflow). Floor the cap to a whole tick so sellCover (which floors) transacts
+                // cleanly. Any residual (P < g when cover is genuinely short) is sourced from poolFree.
+                uint256 maxSell = vault.coverHype() - (ss.netWritten - p.qty);
+                // forge-lint: disable-next-line(divide-before-multiply) -- intentional floor-to-tick
+                if (sellHype > maxSell) sellHype = (maxSell / 1e16) * 1e16;
+                coverSoldHype = sellHype;
+                if (sellHype > 0) {
+                    // M3: do NOT read the return value — sellCover's return is an estimate.
+                    // MockCoverVault credits poolUsdc synchronously; CoreCoverVault is async (T9).
+                    vault.sellCover(sellHype);
+                }
+                // Fail-closed solvency guard: pay g from the pool's OWN free USDC (now replenished by
+                // the cover sale). poolFree() ≥ g ⟺ poolUsdc ≥ totalCollateral + putEscrow + g, so
+                // crediting g leaves poolFree() ≥ 0 (the conservation invariant). Reverts rather than
+                // dip into another party's collateral/escrow when cover is exhausted and P < g.
+                require(poolFree() >= g, "pool");
             }
-            // Source payout from physical vault balance (M3 safety — never from sellCover return)
-            require(vault.poolUsdc() >= g, "pool");
-            // Credit trader; pool free (= poolUsdc − totalCollateral − putEscrow) decreases by g
+            // Credit trader; pool free decreases by g (offset by the cover-sale proceeds credited above).
             traderCollateral[s][t] += g;
             totalCollateral += g; // T6: keep Σ collateral in lockstep
             ss.netWritten -= p.qty;
             delete positions[s][t];
             // forge-lint: disable-next-line(unsafe-typecast)
-            emit Closed(t, int256(g), flooredHype);
+            emit Closed(t, int256(g), coverSoldHype);
         } else {
             // ── Loss branch ──────────────────────────────────────────────────
             uint256 l = markLossU + fundingU - markGainU;
@@ -462,5 +488,41 @@ contract EverlastingBook {
             return;
         }
         _closeCall(t);
+    }
+
+    // ── Withdraw (T7) ───────────────────────────────────────────────────────────
+
+    /// @notice Withdraw free (position-closed) trader collateral out of the pool.
+    /// @dev Guarded by the position-closed check: an open position's margin is committed and
+    ///      cannot leave. Conservation-neutral: poolUsdc and totalCollateral both fall by `amt`,
+    ///      so poolFree() and the identity poolUsdc == poolFree + putEscrow + totalCollateral are
+    ///      preserved. `amt > collateral` underflow-reverts on the collateral debit (fail-closed),
+    ///      and the trader's own collateral is physically part of poolUsdc so payoutUsdc can't short.
+    function withdraw(Side side, uint256 amt) external {
+        require(positions[uint8(side)][msg.sender].qty == 0, "open position");
+        traderCollateral[uint8(side)][msg.sender] -= amt; // reverts if amt > collateral
+        totalCollateral -= amt;
+        vault.payoutUsdc(msg.sender, amt);
+        emit Withdrawn(side, msg.sender, amt);
+    }
+
+    // ── LP pool-free liquidity (T7) ─────────────────────────────────────────────
+
+    /// @notice Deposit the LP's OWN capital as pool-free USDC (distinct from trader collateral).
+    /// @dev Physical USDC up, NO trader claim recorded — so poolFree() rises by `amt`. This is the
+    ///      capital that backs put escrow and replenishes winning-call payouts. Conservation holds:
+    ///      poolUsdc rises by `amt`, poolFree rises by `amt`, totalCollateral/putEscrow unchanged.
+    function lpDeposit(uint256 amt) external {
+        vault.pullUsdc(msg.sender, amt);
+        emit LpDeposited(msg.sender, amt);
+    }
+
+    /// @notice Withdraw pool-free USDC (the pool's own uncommitted capital).
+    /// @dev Only poolFree() may leave — trader collateral and put escrow are off-limits. Conservation
+    ///      holds: poolUsdc falls by `amt`, poolFree falls by `amt`, totalCollateral/putEscrow flat.
+    function lpWithdraw(uint256 amt) external {
+        require(poolFree() >= amt, "pool-free");
+        vault.payoutUsdc(msg.sender, amt);
+        emit LpWithdrawn(msg.sender, amt);
     }
 }
