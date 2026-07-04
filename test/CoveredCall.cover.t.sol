@@ -76,7 +76,7 @@ contract CoveredCallCoverTest is Test {
         oracle.set(50e18);
         // unauthorized reverts
         vm.prank(address(0xDEAD));
-        vm.expectRevert("only lp/keeper");
+        vm.expectRevert(bytes("only lp/keeper"));
         market.increaseCover(1e18);
         // keeper can call (keeper = address(0xBEEF))
         vm.prank(address(0xBEEF));

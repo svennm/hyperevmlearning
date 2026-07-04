@@ -114,7 +114,7 @@ contract CoveredCallCloseTest is Test {
     // settle() reverts "solvent" when pendingFunding ≤ collateral
     function test_settle_revertsIfSolvent() public {
         // cumFunding=0 → pendingFunding(alice)=0 → _toUsdc(0)=0; 0 > 5e6 → false → revert
-        vm.expectRevert("solvent");
+        vm.expectRevert(bytes("solvent"));
         market.settle(alice);
     }
 
@@ -166,7 +166,7 @@ contract CoveredCallCloseTest is Test {
     function test_reduceCover_revertsIfBreaksInvariant() public {
         // coverQty=5e18, netWritten=1e18
         // reduce by 5e18: 5-5=0 < 1 → revert "cover<net"
-        vm.expectRevert("cover<net");
+        vm.expectRevert(bytes("cover<net"));
         market.reduceCover(5e18);
 
         // reduce by 4e18: 5-4=1 == netWritten=1 → OK (coverQty stays ≥ netWritten)
@@ -177,13 +177,13 @@ contract CoveredCallCloseTest is Test {
     // openLong(0) reverts "qty=0"
     function test_zeroQty_revertsOpenLong() public {
         vm.prank(alice);
-        vm.expectRevert("qty=0");
+        vm.expectRevert(bytes("qty=0"));
         market.openLong(0);
     }
 
     // increaseCover(0) reverts "qty=0"
     function test_zeroQty_revertsIncreaseCover() public {
-        vm.expectRevert("qty=0");
+        vm.expectRevert(bytes("qty=0"));
         market.increaseCover(0);
     }
 }

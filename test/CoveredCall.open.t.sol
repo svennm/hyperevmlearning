@@ -73,7 +73,7 @@ contract CoveredCallOpenTest is Test {
         market.deposit(5e6);
 
         vm.prank(alice);
-        vm.expectRevert("cover");
+        vm.expectRevert(bytes("cover"));
         market.openLong(1e18);
     }
 
@@ -121,7 +121,7 @@ contract CoveredCallOpenTest is Test {
         market.deposit(5e6);
 
         vm.prank(alice);
-        vm.expectRevert("stale mark");
+        vm.expectRevert(bytes("stale mark"));
         market.openLong(1e18);
     }
 
@@ -187,7 +187,7 @@ contract CoveredCallOpenTest is Test {
 
         // No remaining cover (coverQty=1e18 == netWritten=1e18) → any qty reverts
         vm.prank(bob);
-        vm.expectRevert("cover");
+        vm.expectRevert(bytes("cover"));
         market.openLong(1e18);
     }
 

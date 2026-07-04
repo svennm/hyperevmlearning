@@ -40,18 +40,18 @@ contract CoverVaultMockTest is Test {
 
     function test_buyCover_slippageReverts() public {
         // 1 HYPE costs 20e6; cap at 19e6 → revert
-        vm.expectRevert("slippage");
+        vm.expectRevert(bytes("slippage"));
         vault.buyCover(1e18, 19e6);
     }
 
     function test_buyCover_insufficientPoolReverts() public {
         // 51 HYPE × $20 = 1020e6 > 1000e6 pool → revert
-        vm.expectRevert("pool: insufficient");
+        vm.expectRevert(bytes("pool: insufficient"));
         vault.buyCover(51e18, type(uint256).max);
     }
 
     function test_buyCover_zeroQtyReverts() public {
-        vm.expectRevert("qty=0");
+        vm.expectRevert(bytes("qty=0"));
         vault.buyCover(0, type(uint256).max);
     }
 
@@ -88,13 +88,13 @@ contract CoverVaultMockTest is Test {
     function test_sellCover_below_min_tick_reverts() public {
         vault.buyCover(1e18, type(uint256).max);
         // 0.009 HYPE = 9e15 WAD < 1e16 (one tick) → floored = 0 → revert
-        vm.expectRevert("qty: below min tick");
+        vm.expectRevert(bytes("qty: below min tick"));
         vault.sellCover(9e15);
     }
 
     function test_sellCover_insufficient_cover_reverts() public {
         // No cover in vault
-        vm.expectRevert("cover: insufficient");
+        vm.expectRevert(bytes("cover: insufficient"));
         vault.sellCover(1e18);
     }
 
@@ -126,7 +126,7 @@ contract CoverVaultMockTest is Test {
     }
 
     function test_payoutUsdc_insufficient_reverts() public {
-        vm.expectRevert("pool: insufficient");
+        vm.expectRevert(bytes("pool: insufficient"));
         vault.payoutUsdc(address(0xBEEF), POOL_SEED + 1);
     }
 

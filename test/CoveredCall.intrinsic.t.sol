@@ -90,7 +90,7 @@ contract CallCoveredIntrinsicTest is Test {
 
         // withdraw must revert while position is open
         vm.prank(alice);
-        vm.expectRevert("close first");
+        vm.expectRevert(bytes("close first"));
         market.withdraw(1);
     }
 }
