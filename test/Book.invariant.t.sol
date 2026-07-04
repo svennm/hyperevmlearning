@@ -400,5 +400,7 @@ contract BookInvariantTest is Test {
         assertGt(h.marksCallPosted(), 0, "vacuous: no CALL marks posted");
         assertGt(h.putsOpened(),      0, "vacuous: no PUT opens");
         assertGt(h.callsOpened(),     0, "vacuous: no CALL opens");
+        assertGt(h.callsClosed(),     0, "vacuous: no call closes in fuzz");
+        assertGt(h.putsClosed(),      0, "vacuous: no put closes in fuzz");
     }
 }
