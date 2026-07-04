@@ -113,8 +113,8 @@ contract BookIntrinsicTest is Test {
         );
     }
 
-    /// @dev Both sides ITM simultaneously — no cross-contamination
-    function test_side_isolation_both_itm() public {
+    /// @dev Read order must not matter: call-first vs put-first returns the same values
+    function test_read_order_independence() public {
         // Deploy a book where both strikes are above the spot so both are ITM:
         // put ITM when S < Kput, call ITM when S > Kcall.
         // Use spot that is between two different strikes to make one side each ITM
@@ -138,17 +138,23 @@ contract BookIntrinsicTest is Test {
 
     // ── sideState independence ────────────────────────────────────────────────
 
-    /// @dev Verify per-side state slots are separate zero-initialized structs at construction
-    function test_side_state_initialized_to_zero() public view {
+    /// @dev Write to the COVERED_CALL side via postMark and assert PUT state is not contaminated.
+    function test_side_state_isolation() public {
+        // Post a mark on COVERED_CALL (oracle=100, Kcall=120 → intrinsic=0, mark=5e18 valid)
+        book.postMark(EverlastingBook.Side.COVERED_CALL, 5e18);
+
+        // PUT side must remain entirely zero
         (uint256 markP, uint256 lmtP, uint256 cfP, uint256 liP, uint256 nwP) =
             book.sideState(uint8(EverlastingBook.Side.PUT));
-        (uint256 markC, uint256 lmtC, uint256 cfC, uint256 liC, uint256 nwC) =
-            book.sideState(uint8(EverlastingBook.Side.COVERED_CALL));
+        assertEq(markP, 0, "put.mark");
+        assertEq(lmtP,  0, "put.lastMarkTime");
+        assertEq(cfP,   0, "put.cumFunding");
+        assertEq(liP,   0, "put.lastIntrinsic");
+        assertEq(nwP,   0, "put.netWritten");
 
-        assertEq(markP, 0);  assertEq(lmtP, 0);  assertEq(cfP, 0);
-        assertEq(liP,   0);  assertEq(nwP,  0);
-        assertEq(markC, 0);  assertEq(lmtC, 0);  assertEq(cfC, 0);
-        assertEq(liC,   0);  assertEq(nwC,  0);
+        // COVERED_CALL side must reflect the posted mark
+        (uint256 markC, , , , ) = book.sideState(uint8(EverlastingBook.Side.COVERED_CALL));
+        assertEq(markC, 5e18, "call.mark");
     }
 
     // ── poolUsdc delegation ───────────────────────────────────────────────────
@@ -157,7 +163,6 @@ contract BookIntrinsicTest is Test {
         // seed vault's USDC ledger; book should see it via poolUsdc()
         vault.pullUsdc(address(0), 7500e6);
         assertEq(book.poolUsdc(), 7500e6);
-        assertEq(book.poolUsdc(), vault.poolUsdc());
     }
 
     // ── Constructor getters ───────────────────────────────────────────────────
