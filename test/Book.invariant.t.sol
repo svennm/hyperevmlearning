@@ -38,6 +38,7 @@ contract BookInvariantHandler is Test {
     uint256 public callsOpened;
     uint256 public putsClosed;
     uint256 public callsClosed;
+    uint256 public emergencyUnwinds;
 
     constructor(EverlastingBook _book, MockCoverVault _vault, MockOracle _oracle, address[] memory _actors) {
         book = _book;
@@ -273,6 +274,33 @@ contract BookInvariantHandler is Test {
         amt = bound(amt, 1, book.traderCollateral(PUT_U, a) + 1);
         vm.prank(a);
         try book.withdraw(PUT, amt) {} catch {}
+    }
+
+    // ── Emergency cover unwind (post-unwind state-space exploration) ─────────
+    //
+    // Guarded by callNetWritten == 0 so invariant_coverGate (coverHype >= callNetWritten)
+    // is never violated: after unwind, coverHype >= 0 == callNetWritten. The book is
+    // immediately unpaused so subsequent openLongCall ops (which seed fresh cover) can
+    // replenish coverHype and keep opens reachable — callsClosed/putsClosed stay non-zero.
+    // Rate-limited by seed so opens dominate the campaign and non-vacuity holds.
+
+    function triggerEmergencyUnwind(uint256 seed) external {
+        // ~12.5% of calls — keeps the op rare so opens dominate the fuzz campaign.
+        if (seed % 8 != 0) return;
+        // coverGate guard: only unwind when no CALL positions are open (netWritten == 0).
+        // This ensures coverHype >= 0 == callNetWritten holds trivially after unwind.
+        (,,,, uint256 callNetWritten) = book.sideState(CALL_U);
+        if (callNetWritten > 0) return;
+        // Pause → unwind → immediately unpause so future opens are not blocked.
+        if (book.paused()) {
+            // Already paused from a prior partial op; just unwind + unpause.
+            try book.emergencyUnwindCover() { emergencyUnwinds++; } catch {}
+            try book.unpause() {} catch {}
+            return;
+        }
+        try book.pause() {} catch { return; }
+        try book.emergencyUnwindCover() { emergencyUnwinds++; } catch {}
+        try book.unpause() {} catch {}
     }
 
     // ── Spot driver: sweep across [1, 1000*Kcall] AND crash toward 0 ──────────

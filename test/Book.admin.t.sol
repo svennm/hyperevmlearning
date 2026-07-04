@@ -317,6 +317,85 @@ contract BookAdminTest is Test {
         assertGt(vault.poolUsdc(), 0, "proceeds credited to pool");
     }
 
+    /// @notice C1 regression: after emergencyUnwindCover, two open winning covered-call positions
+    ///         can both close successfully, each paid their gain from poolFree (replenished by the
+    ///         cover-sale proceeds). Fails on old maxSell (checked-underflow revert) and passes
+    ///         with the clamped fix. Conservation identity holds after each close.
+    function test_emergencyUnwind_winning_calls_can_close() public {
+        // ── Open two winning CALL positions ────────────────────────────────
+        vm.prank(KEEPER);
+        book.postMark(CALL, CALL_MARK);  // 5e18
+
+        uint256 qtyA = 1e18;  // 1 HYPE for ALICE
+        uint256 qtyB = 2e18;  // 2 HYPE for BOB — ensures two distinct netWritten contributors
+
+        // IM = _toUsdc(qty * mark / 1e18) + buffer
+        uint256 imA = qtyA * CALL_MARK / 1e18 / 1e12 + 5e6;
+        uint256 imB = qtyB * CALL_MARK / 1e18 / 1e12 + 5e6;
+
+        vm.prank(ALICE);
+        book.deposit(CALL, imA);
+        vm.prank(ALICE);
+        book.openLong(CALL, qtyA);   // ss.netWritten = 1e18
+
+        vm.prank(BOB);
+        book.deposit(CALL, imB);
+        vm.prank(BOB);
+        book.openLong(CALL, qtyB);   // ss.netWritten = 3e18
+
+        // ── Advance mark so both positions win (5e18 → 6e18, ≤ +20% dev) ──
+        vm.warp(block.timestamp + 1800);
+        vm.prank(KEEPER);
+        book.postMark(CALL, 6e18);   // +1 USDC gain per 1e18 qty
+
+        // ── Emergency wind-down ────────────────────────────────────────────
+        // setUp seeded 500e18 cover (tick-aligned) → coverHype drops to 0.
+        // Pool receives ~50_000 USDC from the cover sale (500 HYPE × $100).
+        book.pause();
+        book.emergencyUnwindCover();
+        assertEq(vault.coverHype(), 0, "cover fully unwound (tick-aligned)");
+
+        // ── ALICE closes — must NOT revert with the fix ────────────────────
+        // Old code: maxSell = vault.coverHype() − (ss.netWritten − p.qty)
+        //         = 0 − (3e18 − 1e18) = 0 − 2e18 → checked-underflow → REVERT
+        // New code: ch=0, rem=2e18, ch>rem is false → maxSell=0 → sellHype=0 →
+        //           no vault.sellCover call → require(poolFree() >= g) passes.
+        uint256 colA0 = book.traderCollateral(CALL_U, ALICE);
+        uint256 free0 = book.poolFree();
+        vm.prank(ALICE);
+        book.close(CALL);
+
+        (uint256 qaAfter,,) = book.positions(CALL_U, ALICE);
+        assertEq(qaAfter, 0, "ALICE position deleted");
+        assertGt(book.traderCollateral(CALL_U, ALICE), colA0, "ALICE received gain");
+        assertLt(book.poolFree(), free0, "poolFree decreased by ALICE gain");
+
+        // Conservation after ALICE close
+        assertEq(
+            vault.poolUsdc(),
+            book.poolFree() + book.putEscrow() + book.totalCollateral(),
+            "conservation: after ALICE close"
+        );
+
+        // ── BOB closes — must NOT revert either ───────────────────────────
+        // With old code ALICE's close reverted, so ss.netWritten stayed at 3e18.
+        // BOB would also underflow: 0 − (3e18 − 2e18) = 0 − 1e18 → REVERT.
+        uint256 colB0 = book.traderCollateral(CALL_U, BOB);
+        vm.prank(BOB);
+        book.close(CALL);
+
+        (uint256 qbAfter,,) = book.positions(CALL_U, BOB);
+        assertEq(qbAfter, 0, "BOB position deleted");
+        assertGt(book.traderCollateral(CALL_U, BOB), colB0, "BOB received gain");
+
+        // Conservation after BOB close
+        assertEq(
+            vault.poolUsdc(),
+            book.poolFree() + book.putEscrow() + book.totalCollateral(),
+            "conservation: after BOB close"
+        );
+    }
+
     function test_emergencyUnwind_respects_sub_tick_dust() public {
         // Build a fresh book+vault with non-tick-aligned cover: 1.5 ticks = 15e15 HYPE
         MockCoverVault v2 = new MockCoverVault();

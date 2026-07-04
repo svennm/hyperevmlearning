@@ -458,11 +458,16 @@ contract EverlastingBook {
                 uint256 sellHype = ((hypeForG + 1e16 - 1) / 1e16) * 1e16; // tick = 0.01 HYPE = 1e16 WAD
                 // coverGate guard: never sell cover still backing OTHER open calls. Cap the sale at
                 // the surplus over netWritten_after (= ss.netWritten − p.qty), so coverHype − sellHype
-                // ≥ netWritten_after and `coverHype ≥ callNetWritten` is preserved. coverGate holds
-                // pre-close ⇒ coverHype ≥ ss.netWritten ≥ ss.netWritten − p.qty, so maxSell ≥ p.qty ≥ 0
-                // (no underflow). Floor the cap to a whole tick so sellCover (which floors) transacts
-                // cleanly. Any residual (P < g when cover is genuinely short) is sourced from poolFree.
-                uint256 maxSell = vault.coverHype() - (ss.netWritten - p.qty);
+                // ≥ netWritten_after and `coverHype ≥ callNetWritten` is preserved. In normal operation,
+                // coverGate holds pre-close ⇒ coverHype ≥ ss.netWritten ≥ netWritten_after, so maxSell
+                // ≥ p.qty ≥ 0 (no underflow). After emergencyUnwindCover(), coverHype ≈ 0 while
+                // netWritten_after may be positive — clamp to 0 instead of underflowing so the winner
+                // can still close with the payout sourced from poolFree() (replenished by the cover
+                // sale proceeds). Normal-flow arithmetic is unchanged: ch > rem is always true when
+                // coverGate holds pre-close. Floor the cap to a whole tick so sellCover transacts cleanly.
+                uint256 ch  = vault.coverHype();
+                uint256 rem = ss.netWritten - p.qty; // p.qty <= ss.netWritten for an open position
+                uint256 maxSell = ch > rem ? ch - rem : 0;
                 // forge-lint: disable-next-line(divide-before-multiply) -- intentional floor-to-tick
                 if (sellHype > maxSell) sellHype = (maxSell / 1e16) * 1e16;
                 coverSoldHype = sellHype;
