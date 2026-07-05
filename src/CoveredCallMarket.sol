@@ -2,9 +2,12 @@
 pragma solidity 0.8.35;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 
 contract CoveredCallMarket {
+    using SafeERC20 for IERC20;
+
     IERC20 public immutable usdc;
     ISpotOracle public immutable oracle;
     uint256 public immutable K;   // strike, WAD
@@ -51,7 +54,7 @@ contract CoveredCallMarket {
 
     function lpDeposit(uint256 amt) external {
         require(msg.sender == lp, "only LP");
-        require(usdc.transferFrom(msg.sender, address(this), amt), "transfer");
+        usdc.safeTransferFrom(msg.sender, address(this), amt);
         poolUsdc += amt;
     }
 
@@ -59,11 +62,11 @@ contract CoveredCallMarket {
         require(msg.sender == lp, "only LP");
         require(amt <= poolUsdc, "pool: insufficient");
         poolUsdc -= amt;
-        require(usdc.transfer(msg.sender, amt), "transfer");
+        usdc.safeTransfer(msg.sender, amt);
     }
 
     function deposit(uint256 amt) external {
-        require(usdc.transferFrom(msg.sender, address(this), amt), "transfer");
+        usdc.safeTransferFrom(msg.sender, address(this), amt);
         traderCollateral[msg.sender] += amt;
     }
 
@@ -71,7 +74,7 @@ contract CoveredCallMarket {
         require(positions[msg.sender].qty == 0, "close first");
         require(amt <= traderCollateral[msg.sender], "insufficient");
         traderCollateral[msg.sender] -= amt;
-        require(usdc.transfer(msg.sender, amt), "transfer");
+        usdc.safeTransfer(msg.sender, amt);
     }
 
     function increaseCover(uint256 qtyWad) external {

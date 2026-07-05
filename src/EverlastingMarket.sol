@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.35;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 import {IYieldAdapter} from "./interfaces/IYieldAdapter.sol";
 
 contract EverlastingMarket {
+    using SafeERC20 for IERC20;
+
     enum Side { PUT, CALL }
 
     IERC20 public immutable usdc;
@@ -52,7 +55,7 @@ contract EverlastingMarket {
         require(msg.sender == owner, "only owner");
         require(amt <= feeAccrued, "fee: insufficient");
         feeAccrued -= amt;
-        require(usdc.transfer(to, amt), "transfer");
+        usdc.safeTransfer(to, amt);
     }
 
     function setYieldAdapter(address a) external {
@@ -72,7 +75,7 @@ contract EverlastingMarket {
         require(poolFree > reserve, "nothing to sweep");
         uint256 amt = poolFree - reserve;
         poolFree -= amt; deployedToYield += amt;
-        require(usdc.approve(yieldAdapter, amt), "approve");
+        usdc.forceApprove(yieldAdapter, amt);
         IYieldAdapter(yieldAdapter).deposit(amt);
     }
     // Realize adapter gains (balance - principal) to the protocol fee bucket.
@@ -110,7 +113,7 @@ contract EverlastingMarket {
 
     function lpDeposit(uint256 amt) external {
         require(msg.sender == lp, "only LP");
-        require(usdc.transferFrom(msg.sender, address(this), amt), "transfer");
+        usdc.safeTransferFrom(msg.sender, address(this), amt);
         poolFree += amt;
     }
     function lpWithdraw(uint256 amt) external {
@@ -119,17 +122,17 @@ contract EverlastingMarket {
         _ensureLiquidity(amt);
         require(amt <= poolFree, "pool: illiquid");
         poolFree -= amt;
-        require(usdc.transfer(msg.sender, amt), "transfer");
+        usdc.safeTransfer(msg.sender, amt);
     }
     function deposit(uint256 amt) external {
-        require(usdc.transferFrom(msg.sender, address(this), amt), "transfer");
+        usdc.safeTransferFrom(msg.sender, address(this), amt);
         traderCollateral[msg.sender] += amt;
     }
     function withdraw(uint256 amt) external {
         require(positions[msg.sender].qty == 0, "close first");
         require(amt <= traderCollateral[msg.sender], "insufficient");
         traderCollateral[msg.sender] -= amt;
-        require(usdc.transfer(msg.sender, amt), "transfer");
+        usdc.safeTransfer(msg.sender, amt);
     }
 
     function _escrowUsdc(uint256 qtyWad) internal view returns (uint256) {
@@ -183,11 +186,29 @@ contract EverlastingMarket {
 
     event Closed(address indexed trader, int256 pnlUsdc);
 
-    function settle(address t) external {
+    /// @notice Trader's net loss in USDC (0 if net gain) — mirrors _closeFor's netU EXACTLY:
+    ///         netLoss = funding + markLoss − markGain. The old settle predicate used funding ALONE,
+    ///         so a long position with a mark loss (funding < collateral but funding+markLoss >
+    ///         collateral) was net-insolvent yet could not be permissionlessly settled, leaving the
+    ///         shortfall on the pool. This closes that gap (parity with CoveredCallMarket /
+    ///         EverlastingBook I2). Escrow (qty·W) fully collateralizes the pool's PAYOUT to a winner;
+    ///         it does NOT cap the trader's OWED loss, which is what settle must gate on.
+    function netLossUsdc(address t) public view returns (uint256) {
         Position memory p = positions[t];
-        require(p.qty > 0, "no position");
-        uint256 fundingU = _toUsdc(pendingFunding(t));
-        require(fundingU > traderCollateral[t], "solvent");
+        if (p.qty == 0) return 0;
+        uint256 fundingU = _toUsdc(p.qty * (cumFunding - p.entryCumFunding) / 1e18);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 markPnlWad = int256(p.qty) * (int256(mark) - int256(p.entryMark)) / 1e18;
+        int256 markPnlU = markPnlWad >= 0
+            ? int256(_toUsdc(uint256(markPnlWad)))
+            : -int256(_toUsdc(uint256(-markPnlWad)));
+        int256 netU = markPnlU - int256(fundingU);
+        return netU < 0 ? uint256(-netU) : 0;
+    }
+
+    function settle(address t) external {
+        require(positions[t].qty > 0, "no position");
+        require(netLossUsdc(t) > traderCollateral[t], "solvent");
         _closeFor(t);
     }
 
