@@ -6,7 +6,11 @@ import {CoreWriterLib} from "@hyper-evm-lib/src/CoreWriterLib.sol";
 import {PrecompileLib} from "@hyper-evm-lib/src/PrecompileLib.sol";
 import {HLConstants} from "@hyper-evm-lib/src/common/HLConstants.sol";
 
-/// @title CoreCoverVault
+/// @title CoreCoverVault — DEPRECATED
+/// @custom:deprecated SUPERSEDED by src/EvmUsdcCoverVault.sol. Its `pullUsdc` reverts (HyperCore has
+///   no on-chain ERC20 transferFrom), so book.deposit cannot take trader collateral live — the exact
+///   bug EvmUsdcCoverVault fixes. Its fund-exit paths were also NOT hardened by the C1 trustless-
+///   custody fix. DO NOT DEPLOY. Retained for sim-test history ONLY.
 /// @notice `ICoverVault` implementation backed by HyperCore spot HYPE via CoreWriter.
 ///         Buy/sell cover = IOC spot limit orders on asset 11035 (HYPE/USDC pair 1035, testnet).
 ///         `payoutUsdc` = `spotSend` USDC to the recipient's Core account.

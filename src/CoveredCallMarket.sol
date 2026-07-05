@@ -5,6 +5,12 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 
+/// @title CoveredCallMarket — DEPRECATED (and unsafe: see below)
+/// @custom:deprecated Slice-3a covered-call accounting scaffold. SUPERSEDED by src/EverlastingBook.sol.
+///   DO NOT DEPLOY. Its "cover" (coverQty/coverEntry) is abstract accounting that is NEVER converted
+///   to USDC, so a deep-ITM winner whose gain exceeds poolUsdc CANNOT close (require(poolUsdc>=g))
+///   until the LP manually tops up — it is NOT cash-covered. EverlastingBook's real sellCover→USDC
+///   vault (I3) is the fix. Retained for slice-3a test history ONLY.
 contract CoveredCallMarket {
     using SafeERC20 for IERC20;
 

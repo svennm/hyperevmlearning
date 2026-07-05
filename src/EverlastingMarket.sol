@@ -5,6 +5,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 import {IYieldAdapter} from "./interfaces/IYieldAdapter.sol";
 
+/// @title EverlastingMarket — DEPRECATED
+/// @custom:deprecated Slice-2 single-market put / capped-call. SUPERSEDED by src/EverlastingBook.sol
+///   (unified two-sided book with real spot-HYPE cover, P(U) funding, and trustless custody).
+///   Retained for slice-2 test history ONLY — DO NOT DEPLOY. Canonical deploy path: DeployBook.s.sol.
 contract EverlastingMarket {
     using SafeERC20 for IERC20;
 
