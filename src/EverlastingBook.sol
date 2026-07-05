@@ -3,6 +3,9 @@ pragma solidity 0.8.35;
 
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 import {ICoverVault} from "./interfaces/ICoverVault.sol";
+import {OptionMath} from "./OptionMath.sol";
+import {RealizedVol} from "./RealizedVol.sol";
+import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
 /// @title EverlastingBook
 /// @notice Two-sided everlasting options book: PUT + COVERED_CALL, unified pool via ICoverVault.
@@ -29,6 +32,19 @@ contract EverlastingBook {
     uint256 public constant MAX_UMAX        = 95e16;
     /// @notice Clamp on the (divergent) call-side surcharge shape (WAD).
     uint256 public constant MAX_UTIL_SHAPE  = 1000e18;
+
+    // ── On-chain fair-value mark (kills H2: keeper mark is band-bound to on-chain BS fair value) ──
+
+    /// @notice Half-width of the fair-value band (bps). Keeper mark must be within ±this of `fairMark`.
+    uint256 internal constant MARK_BAND_BPS = 1000;    // ±10%
+    /// @notice Put-skew steepness β: σ_eff = σ·(1 + β·ln(S/K)₊) for OTM puts (crash premium).
+    uint256 internal constant BETA_PUT      = 0.5e18;
+    /// @notice Everlasting basket base maturity (WAD years, ~1 week); maturities double per term.
+    uint256 internal constant TAU_BASE      = 0.02e18;
+    /// @notice Basket term count (weights halve ⇒ tail negligible).
+    uint8   internal constant MARK_N_TERMS  = 6;
+    /// @notice σ ceiling after the skew multiplier (mirrors RealizedVol.SIGMA_MAX).
+    uint256 internal constant SIGMA_CEIL    = 3e18;
 
     // ── Immutables ─────────────────────────────────────────────────────────────
 
@@ -131,6 +147,10 @@ contract EverlastingBook {
     ///         owner tightens it. 0 would brick openLong, so setUMax rejects 0 and the ctor seeds WAD.
     uint256 public uMax;
 
+    /// @notice On-chain realized-vol source. address(0) ⇒ band inactive (bootstrap: old deviation cap).
+    ///         Once set AND ready(), postMark bounds the keeper mark to ±MARK_BAND_BPS of fairMark().
+    RealizedVol public vol;
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     event Deposited(Side indexed side, address indexed trader, uint256 amt);
@@ -157,6 +177,8 @@ contract EverlastingBook {
     event UtilKappaSet(uint256 oldKappa, uint256 newKappa);
     /// @notice Emitted when the owner changes the hard utilization cap uMax.
     event UMaxSet(uint256 oldUMax, uint256 newUMax);
+    /// @notice Emitted when the owner wires (or rewires) the realized-vol source.
+    event VolSet(address indexed vol);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -226,6 +248,47 @@ contract EverlastingBook {
         require(newUMax <= MAX_UMAX, "uMax>max");
         emit UMaxSet(uMax, newUMax);
         uMax = newUMax;
+    }
+
+    /// @notice Wire the on-chain realized-vol source (owner only). Once set and `vol.ready()`, the
+    ///         keeper mark is bound to the on-chain fair value in postMark. Pass address(0) to disable.
+    function setVol(RealizedVol newVol) external onlyOwner {
+        vol = newVol;
+        emit VolSet(address(newVol));
+    }
+
+    // ── On-chain fair-value mark (BS everlasting + put-skew) ──────────────────
+
+    /// @notice Skew-adjusted σ for a strike: put skew richens OTM puts (S>K); calls flat in v1.
+    function _skewedSigma(bool isCall, uint256 S, uint256 K, uint256 sig)
+        internal pure returns (uint256)
+    {
+        if (isCall) return sig;
+        int256 m = FixedPointMathLib.lnWad(int256(FixedPointMathLib.divWad(S, K)));
+        if (m <= 0) return sig; // ATM / ITM put — no crash-premium richening
+        uint256 s = FixedPointMathLib.mulWad(sig, WAD + FixedPointMathLib.mulWad(BETA_PUT, uint256(m)));
+        return s > SIGMA_CEIL ? SIGMA_CEIL : s;
+    }
+
+    /// @notice On-chain fair mark for a side (WAD): skewed-σ everlasting BS. PUT = capped put spread
+    ///         (long Kput − short Kput−Wput, skewed per leg); CALL = uncapped call.
+    function fairMark(Side side) public view returns (uint256) {
+        uint256 S = oracle.spotWad();
+        uint256 sig = vol.sigma();
+        if (side == Side.COVERED_CALL) {
+            return OptionMath.everlastingMark(
+                true, S, Kcall, _skewedSigma(true, S, Kcall, sig), TAU_BASE, MARK_N_TERMS
+            );
+        }
+        uint256 fairHi = OptionMath.everlastingMark(
+            false, S, Kput, _skewedSigma(false, S, Kput, sig), TAU_BASE, MARK_N_TERMS
+        );
+        uint256 Klo = Kput > Wput ? Kput - Wput : 0;
+        if (Klo == 0) return fairHi; // W == K ⇒ vanilla (uncapped) put
+        uint256 fairLo = OptionMath.everlastingMark(
+            false, S, Klo, _skewedSigma(false, S, Klo, sig), TAU_BASE, MARK_N_TERMS
+        );
+        return fairHi > fairLo ? fairHi - fairLo : 0;
     }
 
     /// @notice Initiate a 2-step ownership transfer. Does NOT change owner until acceptOwnership().
@@ -442,10 +505,26 @@ contract EverlastingBook {
         }
 
         bool isFresh = (ss.mark != 0) && (block.timestamp <= ss.lastMarkTime + MAX_MARK_AGE);
+
+        // H2 fix: once vol is wired + ready, bound the keeper mark to ±MARK_BAND_BPS of the on-chain
+        // fair value — an ABSOLUTE anchor, so the keeper can't ramp the mark (the old cap was relative
+        // to the previous mark and compounded). Bootstrap (vol not ready) keeps the old deviation cap.
+        bool bandActive = address(vol) != address(0) && vol.ready();
+        if (bandActive) {
+            uint256 fair = fairMark(side);
+            require(
+                newMark >= fair * (10_000 - MARK_BAND_BPS) / 10_000
+                    && newMark <= fair * (10_000 + MARK_BAND_BPS) / 10_000,
+                "mark band"
+            );
+        }
+
         if (isFresh) {
-            uint256 hi = ss.mark + ss.mark * MAX_MARK_DEV_BPS / 10_000;
-            uint256 lo = ss.mark - ss.mark * MAX_MARK_DEV_BPS / 10_000;
-            require(newMark <= hi && newMark >= lo, "mark deviation");
+            if (!bandActive) {
+                uint256 hi = ss.mark + ss.mark * MAX_MARK_DEV_BPS / 10_000;
+                uint256 lo = ss.mark - ss.mark * MAX_MARK_DEV_BPS / 10_000;
+                require(newMark <= hi && newMark >= lo, "mark deviation");
+            }
 
             uint256 age = block.timestamp - ss.lastMarkTime;
             uint256 periods = age / FUNDING_PERIOD;

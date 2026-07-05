@@ -102,3 +102,30 @@ This replaces H2's compounding *per-previous-mark* cap with an **absolute anchor
 3. **Claude:** Unit 3 book band integration + tests + wiring/deploy update; adversarial audit of all three; full suite green.
 
 `tauBase`, `markBandBps`, `nTerms` are calibration params (owner/immutable) — the band tolerates calibration error, so exact values are tunable post-audit.
+
+---
+
+## Volatility skew (Phase 1 — applied in the book, not OptionMath)
+
+A single realized σ ignores the smile/skew — and the skew IS the crash-risk premium, which is the product. Since **no HYPE options market exists to invert** (we're the price-MAKER, not taker), we CONSTRUCT the surface: realized σ = ATM level, + an imposed **put skew** (crypto is equity-like: OTM puts richest). Applied per-strike in the book when computing `fair`, so `OptionMath` stays skew-agnostic (takes a scalar σ):
+```
+m        = lnWad(int256(S·1e18/K))                 // log-moneyness (signed)
+skewMult = 1e18 + betaPut·max(0, m)/1e18           // richen OTM puts (S>K ⇒ m>0); calls flat in v1
+sigmaEff = clamp(mulWad(sigmaRealized, skewMult), SIGMA_MIN, SIGMA_MAX)
+```
+`betaPut` = owner-set steepness (WAD). The capped put SPREAD uses `sigmaEff` computed **per leg** (K and K−Wput have different moneyness). Calls: `betaCall=0` for v1 (flat).
+
+## Adaptive vol controller (Phase 2 — thin bolt-on, build AFTER Phase 1 proven)
+
+Makes the vol **market-determined as the venue grows** — the pool's own fill-rate is the price signal (no options market needed). PI control: realized-σ+skew = feedforward; P(U) surcharge = proportional/fast; `adaptiveMult` = integral/slow.
+```
+each period: adaptiveMult += k·(U − Ustar)          // U = netWritten/cap (per side), Ustar≈0.5
+             adaptiveMult = clamp(adaptiveMult, MULT_MIN, MULT_MAX)   // e.g. [0.5e18, 3e18]
+sigmaFinal = clamp(mulWad(sigmaEff, adaptiveMult), SIGMA_MIN, SIGMA_MAX)
+```
+Persistent over-target demand ⇒ mark too cheap ⇒ adaptiveMult climbs ⇒ vol rises until demand cools at Ustar → vol is now set by demand, not the model. Auto-transitions (no switch): no flow ⇒ U≈0 ⇒ integral idle ⇒ mark≈model. Safe: U needs real size to move (manip-proof like P(U)), integral is slow + clamped (no cheap drag, no oscillation with conservative k). No double-count: fast proportional (P(U)) vs slow integral (adaptiveMult) are different time scales.
+
+---
+
+## API note (solady — qwen got these wrong first pass)
+Exact signatures: `mulWad(uint,uint)`, `divWad(uint,uint)`, `sMulWad(int,int)`, `sDivWad(int,int)`, `expWad(int)`, `lnWad(int)`, `sqrt(uint)`, `powWad(int,int)`. **No `wadMul`/`wadDiv`.** `mulWad(a,b)=a·b/1e18` already (do NOT add an extra `/1e18`). `sigma()` scaling: `sqrt(varWad·8760·1e18)` gives σ·1e18 (NOT `mulWad(varWad,8760)` — 8760 isn't WAD).

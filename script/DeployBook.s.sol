@@ -5,6 +5,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {OracleLib} from "../src/OracleLib.sol";
 import {EvmUsdcCoverVault} from "../src/EvmUsdcCoverVault.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
+import {RealizedVol} from "../src/RealizedVol.sol";
 import {ISpotOracle} from "../src/interfaces/ISpotOracle.sol";
 import {ICoverVault} from "../src/interfaces/ICoverVault.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -53,11 +54,18 @@ contract DeployBook is Script {
         // cover-buy / bridge ops, which are in-custody moves only.
         vault.initBook(address(book));
 
+        // On-chain fair-value mark: RealizedVol reads the same oracle; wire it into the book. Band
+        // stays inactive (bootstrap deviation cap) until the keeper cron has called updateVol() enough
+        // for vol.ready() — then postMark is bound to ±10% of the on-chain BS fair value (H2 fix).
+        RealizedVol vol = new RealizedVol(ISpotOracle(address(oracle)));
+        book.setVol(vol);
+
         vm.stopBroadcast();
 
         console2.log("OracleLib        ", address(oracle));
         console2.log("EvmUsdcCoverVault", address(vault));
         console2.log("EverlastingBook  ", address(book));
+        console2.log("RealizedVol      ", address(vol));
         console2.log("USDC (EVM ERC20) ", HLConstants.usdc());
         console2.log("owner/deployer   ", deployer);
         console2.log("Kput/Wput/Kcall(wad)", Kput, Wput, Kcall);
