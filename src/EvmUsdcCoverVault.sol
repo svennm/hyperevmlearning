@@ -188,7 +188,12 @@ contract EvmUsdcCoverVault is ICoverVault {
     /// @dev THE FIX: standard ERC20 `transferFrom(from → this)`. This is what CoreCoverVault could
     ///      not do (HyperCore has no on-chain transferFrom), so `book.deposit` now takes trader
     ///      collateral live. `from` must have approved this vault for `amt`.
-    function pullUsdc(address from, uint256 amt) external {
+    /// @dev Keeper-gated (the book is wired as keeper). WITHOUT this gate, anyone could call
+    ///      `pullUsdc(victim, amt)` and drain a trader's approved USDC into the pool UNCREDITED
+    ///      (the book credits collateral only when IT calls pullUsdc). Gating to the book closes
+    ///      that griefing/fund-loss vector; the book pulls on the trader's behalf atomically with
+    ///      crediting `traderCollateral`.
+    function pullUsdc(address from, uint256 amt) external onlyKeeper {
         usdc.safeTransferFrom(from, address(this), amt);
     }
 

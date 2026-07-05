@@ -157,6 +157,23 @@ contract EvmUsdcCoverVaultUnitTest is Test {
         assertEq(vault.keeper(), STRANGE, "keeper updated");
     }
 
+    // Griefing guard (from the qwen audit): a non-keeper must NOT be able to pull an approved
+    // trader's USDC into the pool uncredited. Only the book (keeper) pulls, atomic with crediting.
+    function test_pullUsdc_onlyKeeper_blocksGriefing() public {
+        usdc.mint(TRADER, 1_000e6);
+        vm.prank(TRADER);
+        usdc.approve(address(vault), 1_000e6);
+
+        vm.prank(STRANGE);
+        vm.expectRevert(bytes("only keeper"));
+        vault.pullUsdc(TRADER, 1_000e6);
+
+        // keeper (the book path) can pull
+        vm.prank(KEEPER);
+        vault.pullUsdc(TRADER, 1_000e6);
+        assertEq(usdc.balanceOf(address(vault)), 1_000e6, "keeper pull works");
+    }
+
     function test_ownerAndKeeper_wired() public view {
         assertEq(vault.owner(),  address(this), "owner = deployer");
         assertEq(vault.keeper(), KEEPER,         "keeper = ctor arg");
