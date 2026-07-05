@@ -66,6 +66,9 @@ contract EvmUsdcCoverVault is ICoverVault {
 
     address public immutable owner;
     address public keeper;
+    /// @notice The EverlastingBook — the SOLE authority allowed to move USDC in/out (pull/payout).
+    ///         Set once via initBook. Not owner, not keeper: no EOA can send pooled USDC anywhere.
+    address public book;
     uint128 public cloidSeq;
 
     // ── Constructor ───────────────────────────────────────────────────────────
@@ -86,17 +89,39 @@ contract EvmUsdcCoverVault is ICoverVault {
         _;
     }
 
-    /// @dev Either owner or keeper may call cover/bridge/payout ops.
+    /// @dev Owner or keeper may call cover-buy / bridge ops (in-custody moves; cannot extract funds).
     modifier onlyKeeper() {
         require(msg.sender == owner || msg.sender == keeper, "only keeper");
         _;
     }
 
+    /// @dev USDC in/out is gated to the wired book ONLY — the accounting authority. This is what
+    ///      removes the arbitrary-recipient drain: neither owner nor keeper can move pooled USDC out.
+    modifier onlyBook() {
+        require(msg.sender == book, "only book");
+        _;
+    }
+
+    /// @dev Cover SELLS: the book (winning-call close, I3) or the operator (delta trim / wind-down).
+    modifier onlyBookOrKeeper() {
+        require(msg.sender == book || msg.sender == owner || msg.sender == keeper, "book/keeper");
+        _;
+    }
+
     // ── Admin ─────────────────────────────────────────────────────────────────
 
-    /// @notice Transfer keeper role (owner only).
+    /// @notice Transfer keeper role (owner only). Keeper can only move funds WITHIN vault custody
+    ///         (buy/sell cover, bridge between layers) — never extract, so this is not a rug lever.
     function setKeeper(address _keeper) external onlyOwner {
         keeper = _keeper;
+    }
+
+    /// @notice One-time wiring of the accounting authority (the EverlastingBook). Fund exits
+    ///         (pullUsdc/payoutUsdc) are gated to THIS address only — not owner, not keeper — so no
+    ///         EOA can send pooled USDC to an arbitrary recipient. Set once, right after book deploy.
+    function initBook(address _book) external onlyOwner {
+        require(book == address(0) && _book != address(0), "book set");
+        book = _book;
     }
 
     // ── ICoverVault: view ─────────────────────────────────────────────────────
@@ -164,7 +189,7 @@ contract EvmUsdcCoverVault is ICoverVault {
     ///      this contract's Core HYPE balance indefinitely. Returns ESTIMATED usdcOut at current spot
     ///      (actual proceeds are async and accrue to the Core-USDC float). Identical to CoreCoverVault.
     ///      ASYNC: poolUsdc()'s Core-float term does NOT increase until the fill settles.
-    function sellCover(uint256 hypeWad) external onlyKeeper returns (uint256 usdcOut) {
+    function sellCover(uint256 hypeWad) external onlyBookOrKeeper returns (uint256 usdcOut) {
         // forge-lint: disable-next-line(divide-before-multiply) -- intentional floor-to-tick
         uint256 floored = (hypeWad / HYPE_TICK) * HYPE_TICK;
         require(floored > 0, "qty: below min tick");
@@ -188,21 +213,21 @@ contract EvmUsdcCoverVault is ICoverVault {
     /// @dev THE FIX: standard ERC20 `transferFrom(from → this)`. This is what CoreCoverVault could
     ///      not do (HyperCore has no on-chain transferFrom), so `book.deposit` now takes trader
     ///      collateral live. `from` must have approved this vault for `amt`.
-    /// @dev Keeper-gated (the book is wired as keeper). WITHOUT this gate, anyone could call
-    ///      `pullUsdc(victim, amt)` and drain a trader's approved USDC into the pool UNCREDITED
-    ///      (the book credits collateral only when IT calls pullUsdc). Gating to the book closes
-    ///      that griefing/fund-loss vector; the book pulls on the trader's behalf atomically with
-    ///      crediting `traderCollateral`.
-    function pullUsdc(address from, uint256 amt) external onlyKeeper {
+    /// @dev BOOK-gated. WITHOUT this gate, anyone could call `pullUsdc(victim, amt)` and drain a
+    ///      trader's approved USDC into the pool UNCREDITED (the book credits collateral only when IT
+    ///      calls pullUsdc). Gating to the book — not owner/keeper — closes that griefing/fund-loss
+    ///      vector; the book pulls on the trader's behalf atomically with crediting `traderCollateral`.
+    function pullUsdc(address from, uint256 amt) external onlyBook {
         usdc.safeTransferFrom(from, address(this), amt);
     }
 
     /// @inheritdoc ICoverVault
-    /// @dev Standard ERC20 `transfer(this → to)` from the EVM USDC balance. Keeper-gated (the book is
-    ///      wired as keeper, so book.withdraw/lpWithdraw are authorized). NOTE: pays from the EVM
-    ///      layer only — the keeper must `bridgeUsdcToEvm` any Core-float proceeds first if the EVM
-    ///      balance is short (the honest two-layer boundary).
-    function payoutUsdc(address to, uint256 amt) external onlyKeeper {
+    /// @dev Standard ERC20 `transfer(this → to)` from the EVM USDC balance. BOOK-gated — this is the
+    ///      ONLY USDC exit, and only the book (which pays trader-owed collateral on withdraw, or
+    ///      poolFree on lpWithdraw) can trigger it. Neither owner nor keeper can call it, so there is
+    ///      no arbitrary-recipient drain. NOTE: pays from the EVM layer only — the keeper must
+    ///      `bridgeUsdcToEvm` any Core-float proceeds first if the EVM balance is short.
+    function payoutUsdc(address to, uint256 amt) external onlyBook {
         usdc.safeTransfer(to, amt);
     }
 

@@ -51,6 +51,7 @@ contract EvmUsdcCoverVaultSimTest is Test {
 
         usdc  = new MockUSDC();
         vault = new EvmUsdcCoverVault(IERC20(address(usdc)), address(this)); // owner+keeper = this
+        vault.initBook(address(this)); // this test contract is the book (sole fund-exit authority)
 
         // Activate Core account and seed a 1000-USDC Core float (pre-bridged, pre-cover).
         CoreSimulatorLib.forceAccountActivation(address(vault));
@@ -129,10 +130,10 @@ contract EvmUsdcCoverVaultSimTest is Test {
         vault.sellCover(1e18); // no HYPE seeded
     }
 
-    function test_sim_sellCover_onlyKeeper() public {
+    function test_sim_sellCover_onlyBookOrKeeper() public {
         CoreSimulatorLib.forceSpotBalance(address(vault), HYPE_TOKEN, 1e8);
         vm.prank(STRANGE);
-        vm.expectRevert("only keeper");
+        vm.expectRevert("book/keeper"); // sellCover is book-or-keeper; a stranger is neither
         vault.sellCover(1e18);
     }
 

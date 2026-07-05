@@ -49,6 +49,7 @@ contract EvmUsdcCoverVaultUnitTest is Test {
 
         usdc  = new MockUSDC();
         vault = new EvmUsdcCoverVault(IERC20(address(usdc)), KEEPER); // owner = this
+        vault.initBook(address(this)); // this test contract is the book (the sole fund-exit authority)
 
         // Activate the vault Core account; leave the Core-USDC float at 0.
         CoreSimulatorLib.forceAccountActivation(address(vault));
@@ -88,23 +89,26 @@ contract EvmUsdcCoverVaultUnitTest is Test {
 
     function test_payoutUsdc_transfersOut() public {
         usdc.mint(address(vault), 500e6);
-        vault.payoutUsdc(TRADER, 300e6); // owner may call
+        vault.payoutUsdc(TRADER, 300e6); // book (this) may call
         assertEq(usdc.balanceOf(TRADER), 300e6,          "recipient paid");
         assertEq(usdc.balanceOf(address(vault)), 200e6,  "vault balance reduced");
     }
 
-    function test_payoutUsdc_onlyKeeperReverts() public {
+    function test_payoutUsdc_nonBookReverts() public {
         usdc.mint(address(vault), 500e6);
         vm.prank(STRANGE);
-        vm.expectRevert("only keeper");
+        vm.expectRevert("only book");
         vault.payoutUsdc(TRADER, 100e6);
     }
 
-    function test_payoutUsdc_keeperCanCall() public {
+    /// @notice C1 RUG REGRESSION: the KEEPER (the old fund authority) can NO LONGER extract USDC.
+    ///         Only the wired book can move funds out — no EOA can send pooled USDC to an arbitrary
+    ///         recipient. This is the whole point of the trustless-custody change.
+    function test_payoutUsdc_keeperCannotExtract() public {
         usdc.mint(address(vault), 500e6);
         vm.prank(KEEPER);
-        vault.payoutUsdc(TRADER, 100e6);
-        assertEq(usdc.balanceOf(TRADER), 100e6, "keeper payout ok");
+        vm.expectRevert("only book");
+        vault.payoutUsdc(KEEPER, 100e6);
     }
 
     function test_payoutUsdc_insufficientReverts() public {
@@ -157,21 +161,41 @@ contract EvmUsdcCoverVaultUnitTest is Test {
         assertEq(vault.keeper(), STRANGE, "keeper updated");
     }
 
-    // Griefing guard (from the qwen audit): a non-keeper must NOT be able to pull an approved
-    // trader's USDC into the pool uncredited. Only the book (keeper) pulls, atomic with crediting.
-    function test_pullUsdc_onlyKeeper_blocksGriefing() public {
+    // Griefing guard: a non-book caller must NOT be able to pull an approved trader's USDC into the
+    // pool uncredited. ONLY the book pulls, atomic with crediting traderCollateral — not even the keeper.
+    function test_pullUsdc_onlyBook_blocksGriefing() public {
         usdc.mint(TRADER, 1_000e6);
         vm.prank(TRADER);
         usdc.approve(address(vault), 1_000e6);
 
         vm.prank(STRANGE);
-        vm.expectRevert(bytes("only keeper"));
+        vm.expectRevert(bytes("only book"));
+        vault.pullUsdc(TRADER, 1_000e6);
+        vm.prank(KEEPER);
+        vm.expectRevert(bytes("only book"));
         vault.pullUsdc(TRADER, 1_000e6);
 
-        // keeper (the book path) can pull
-        vm.prank(KEEPER);
+        // Only the book (this test contract, wired via initBook) can pull.
         vault.pullUsdc(TRADER, 1_000e6);
-        assertEq(usdc.balanceOf(address(vault)), 1_000e6, "keeper pull works");
+        assertEq(usdc.balanceOf(address(vault)), 1_000e6, "book pull works");
+    }
+
+    // ── initBook: one-time, owner-only, non-zero ──────────────────────────────
+    function test_initBook_onceOnly() public {
+        vm.expectRevert("book set"); // already set to this in setUp
+        vault.initBook(address(0xB00C));
+    }
+
+    function test_initBook_onlyOwner() public {
+        MockUSDC u2 = new MockUSDC();
+        EvmUsdcCoverVault v2 = new EvmUsdcCoverVault(IERC20(address(u2)), KEEPER);
+        vm.prank(STRANGE);
+        vm.expectRevert("only owner");
+        v2.initBook(address(0xB00C));
+    }
+
+    function test_book_wired() public view {
+        assertEq(vault.book(), address(this), "book = wired fund authority");
     }
 
     function test_ownerAndKeeper_wired() public view {

@@ -47,10 +47,11 @@ contract DeployBook is Script {
             deployer,                                        // book keeper (posts marks)
             Kput, Wput, Kcall, putCap, callCap
         );
-        // Book must be the vault's keeper so its deposit path can call pullUsdc and its close path
-        // can call sellCover. onlyKeeper == owner||keeper, so the deployer (owner) can still call
-        // cover/bridge ops too.
-        vault.setKeeper(address(book));
+        // Wire the book as the vault's SOLE fund-exit authority (pullUsdc/payoutUsdc are onlyBook,
+        // and sellCover is book-or-keeper). This is trustless custody: neither owner nor keeper can
+        // move pooled USDC to an arbitrary recipient. The keeper stays = deployer (from the ctor) for
+        // cover-buy / bridge ops, which are in-custody moves only.
+        vault.initBook(address(book));
 
         vm.stopBroadcast();
 

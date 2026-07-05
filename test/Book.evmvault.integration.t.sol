@@ -81,8 +81,9 @@ contract BookEvmVaultIntegrationTest is Test {
             KPUT, WPUT, KCALL,
             10_000e18, 10_000e18
         );
-        // Book is the vault's keeper → its sellCover / payoutUsdc calls are authorized.
-        vault.setKeeper(address(book));
+        // Book is the vault's sole fund-exit authority (pullUsdc/payoutUsdc onlyBook, sellCover
+        // book-or-keeper). Keeper stays = this (owner) for cover-buy / bridge ops.
+        vault.initBook(address(book));
 
         // ── Seed Core-USDC float (LP capital pre-bridged) + keeper buys cover ─
         CoreSimulatorLib.forceAccountActivation(address(vault));
