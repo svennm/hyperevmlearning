@@ -56,8 +56,6 @@ contract EvmUsdcCoverVault is ICoverVault {
     /// @dev szDecimals=2: 0.01 HYPE minimum tradable increment = 1e16 WAD
     uint256 internal constant HYPE_TICK  = 1e16;
     uint256 internal constant WAD        = 1e18;
-    /// @dev 50 bps = 0.5% slippage buffer for marketable IOC orders (SELL side)
-    uint256 internal constant SLIPPAGE_BPS = 50;
     /// @dev Marketability buffer over the live best quote (bps). A FIXED constant — it does not set the
     ///      price (the on-chain BBO does); it only guarantees the IOC crosses if the quote ticks.
     uint256 internal constant COVER_CROSS_BPS = 50;
@@ -190,8 +188,9 @@ contract EvmUsdcCoverVault is ICoverVault {
 
     /// @inheritdoc ICoverVault
     /// @dev Floors hypeWad to the nearest HYPE_TICK (0.01 HYPE = 1e16 WAD). Sub-tick dust remains in
-    ///      this contract's Core HYPE balance indefinitely. Returns ESTIMATED usdcOut at current spot
-    ///      (actual proceeds are async and accrue to the Core-USDC float). Identical to CoreCoverVault.
+    ///      this contract's Core HYPE balance indefinitely. Returns ESTIMATED usdcOut priced at the
+    ///      live bbo.bid (actual proceeds are async and accrue to the Core-USDC float).
+    ///      limitPx = bbo.bid × 100 × (10000 − COVER_CROSS_BPS) / 10000  — crosses INTO the bid.
     ///      ASYNC: poolUsdc()'s Core-float term does NOT increase until the fill settles.
     function sellCover(uint256 hypeWad) external onlyBookOrKeeper returns (uint256 usdcOut) {
         // forge-lint: disable-next-line(divide-before-multiply) -- intentional floor-to-tick
@@ -201,11 +200,11 @@ contract EvmUsdcCoverVault is ICoverVault {
         uint256 hypeWei    = uint256(PrecompileLib.spotBalance(address(this), HYPE_TOKEN).total);
         uint256 currentWad = hypeWei * 1e10;
         require(currentWad >= floored, "cover: insufficient");
-        uint64 rawPx = PrecompileLib.spotPx(HYPE_SPOT_INDEX);
-        usdcOut      = _toUsdc(floored * (uint256(rawPx) * 1e12) / WAD);
-        uint64 sz    = uint64(floored / 1e10);
-        // limitPx below current bid for marketable IOC fill.
-        uint64 limitPx = uint64(uint256(rawPx) * 100 * (10000 - SLIPPAGE_BPS) / 10000);
+        PrecompileLib.Bbo memory q = PrecompileLib.bbo(uint64(HYPE_SPOT_ASSET));
+        require(q.bid > 0, "no bid");
+        usdcOut     = _toUsdc(floored * (uint256(q.bid) * 1e12) / WAD);
+        uint64 sz   = uint64(floored / 1e10);
+        uint64 limitPx = uint64(uint256(q.bid) * 100 * (10000 - COVER_CROSS_BPS) / 10000);
         CoreWriterLib.placeLimitOrder(
             HYPE_SPOT_ASSET, false, limitPx, sz, false, HLConstants.LIMIT_ORDER_TIF_IOC, ++cloidSeq
         );

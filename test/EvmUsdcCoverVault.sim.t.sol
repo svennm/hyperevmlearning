@@ -111,7 +111,16 @@ contract EvmUsdcCoverVaultSimTest is Test {
 
     // ── sellCover credits the Core float; szDecimals=2 floor leaves dust ──────
 
+    function test_sim_sellCover_crossesLiveBid() public {
+        _mockBbo(33_000_000, 62_989_000);
+        CoreSimulatorLib.forceSpotBalance(address(vault), HYPE_TOKEN, 1e8); // 1 HYPE
+        uint256 out = vault.sellCover(1e18);
+        CoreSimulatorLib.nextBlock();
+        assertApproxEqAbs(out, 33e6, 1e6, "sell est at ~bid $33");
+    }
+
     function test_sim_sellCover_creditsCoreFloat_flooredDust() public {
+        _mockBbo(25_000_000, 25_000_000); // bid=$25 drives usdcOut estimate
         // Seed 0.9993 HYPE cover
         CoreSimulatorLib.forceSpotBalance(address(vault), HYPE_TOKEN, 99930000); // 0.9993 HYPE wei
         uint256 poolBefore = vault.poolUsdc(); // 1000e6 (Core float)
