@@ -48,6 +48,8 @@ mark= sum / w
 
 ## Unit 2 — `src/RealizedVol.sol` (contract) — manipulation-resistant σ
 
+> **UPDATED (AUDIT-M fix, commit 5c11306):** the original "one tick / period, first-caller-wins" sample let an adversary call `updateVol()` at a quiet tick to bias σ DOWN. As built, `updateVol()` is callable intra-period and records a **monotone high-water `maxRet` = max |return| vs the period anchor** (capped R_MAX); the EWMA fold happens once at the period boundary using that max (which also captures the boundary tick vs the OLD anchor). An adversary can only ever RAISE the max, never lower it. **F1 (2026-07-05):** `ready()` now gates on `samples ≥ READY_SAMPLES(3)`, and `EverlastingBook.postMark` pings `updateVol()` every mark, so the keeper samples σ on the mark cadence.
+
 State: `uint256 varWad; uint256 lastPrice; uint256 lastTime;`. Reads the blended HL mark via the SAME oracle the book uses (`ISpotOracle.spotWad()` — inject in ctor).
 
 Constants: `LAMBDA=0.99e18` (EWMA decay, ~3-day half-life at 1h), `R_MAX=0.10e18` (per-sample return cap), `PERIOD=3600`, `PERIODS_PER_YEAR=8760`, `SIGMA_MIN=0.20e18`, `SIGMA_MAX=3.0e18`.
@@ -115,15 +117,25 @@ sigmaEff = clamp(mulWad(sigmaRealized, skewMult), SIGMA_MIN, SIGMA_MAX)
 ```
 `betaPut` = owner-set steepness (WAD). The capped put SPREAD uses `sigmaEff` computed **per leg** (K and K−Wput have different moneyness). Calls: `betaCall=0` for v1 (flat).
 
-## Adaptive vol controller (Phase 2 — thin bolt-on, build AFTER Phase 1 proven)
+## Adaptive vol controller (Phase 2 — BUILT 2026-07-05, commit 5c11306)
 
 Makes the vol **market-determined as the venue grows** — the pool's own fill-rate is the price signal (no options market needed). PI control: realized-σ+skew = feedforward; P(U) surcharge = proportional/fast; `adaptiveMult` = integral/slow.
 ```
-each period: adaptiveMult += k·(U − Ustar)          // U = netWritten/cap (per side), Ustar≈0.5
-             adaptiveMult = clamp(adaptiveMult, MULT_MIN, MULT_MAX)   // e.g. [0.5e18, 3e18]
-sigmaFinal = clamp(mulWad(sigmaEff, adaptiveMult), SIGMA_MIN, SIGMA_MAX)
+each period: adaptiveMult += k·(U − uStar)          // U = netWritten/cap (per side), uStar default 0.5
+             adaptiveMult = clamp(adaptiveMult, MULT_MIN, MULT_MAX)   // [0.5e18, 3e18]
+sigmaFinal = clamp(mulWad(sigmaEff, adaptiveMult), SIGMA_FLOOR, SIGMA_CEIL)  // [0.2e18, 3e18]
 ```
-Persistent over-target demand ⇒ mark too cheap ⇒ adaptiveMult climbs ⇒ vol rises until demand cools at Ustar → vol is now set by demand, not the model. Auto-transitions (no switch): no flow ⇒ U≈0 ⇒ integral idle ⇒ mark≈model. Safe: U needs real size to move (manip-proof like P(U)), integral is slow + clamped (no cheap drag, no oscillation with conservative k). No double-count: fast proportional (P(U)) vs slow integral (adaptiveMult) are different time scales.
+Persistent over-target demand ⇒ mark too cheap ⇒ adaptiveMult climbs ⇒ vol rises until demand cools at uStar → vol is now set by demand, not the model. Auto-transitions (no switch): no flow ⇒ U≈0 ⇒ integral idle ⇒ mark≈model. Safe: U needs real size to move (manip-proof like P(U)), integral is slow + clamped (no cheap drag, no oscillation with conservative k). No double-count: fast proportional (P(U)) vs slow integral (adaptiveMult) are different time scales.
+
+**As built:** per-side `adaptiveMult[side]` (seeded WAD, inert), folded once per funding period in `postMark`'s `if(periods>0)` block via `_updateAdaptiveMult` (signed int256 step, clamped `[MULT_MIN,MULT_MAX]`), only when `adaptiveK>0`. Applied as a σ level-shift in `fairMark` via `_adaptiveSigma` (below the ±band, so the keeper mark stays pinned). Owner setter `setAdaptiveParams(k, uStar)` hard-caps `k ≤ MAX_ADAPT_K(0.1e18)` and requires `uStar ∈ (0,WAD)`. Default `k=0` ⇒ fully inert (existing suite unchanged). View: `effectiveSigma(side)`. Because `periods` is hard-bounded to ≤2 by the `MAX_MARK_AGE` staleness gate, `|step| ≤ 0.2e18` — no int256 overflow. `adaptiveMult` touches ONLY the control variable (no USDC/escrow/collateral), so conservation is structurally unaffected; the 128k-call conservation fuzz runs with `setAdaptiveParams` active. 6 adversarial unit tests (`test/Book.adaptive.t.sol`).
+
+**Adversarial audit (opus, 2026-07-05): SOUND** — no critical/high, overflow refuted, σ biased up not down, per-side isolation + band-ordering + conservation all verified; math re-derived (σ scaling, 0.936/0.748) independently.
+- **F1 (Medium, liveness) FIXED (commit f36647c):** σ only rose on an *observed* spike ⇒ an unobserved transient could drift σ to the floor and underprice puts. Fix: `RealizedVol.ready()` gates on `samples ≥ READY_SAMPLES(3)` (band never activates on a 1-sample σ) + `postMark` pings `updateVol()` (guarded, after the band check) so the keeper samples σ at every mark.
+- **F3 (below-model floor): kept symmetric [0.5, 3]** (user decision) — the controller may cheapen to 0.5×σ (floored at SIGMA_FLOOR=0.2 abs) to clear soft inventory like a market-maker. Note: P(U) and adaptiveMult both key off U, so they reinforce — this is one PI controller (proportional + integral), tune the gains jointly.
+- **F2 (Low):** the σ proxy is range-style (max deviation vs anchor), not close-to-close — rate-limited + EWMA-diluted, accepted.
+
+### Phase 3 (deferred, still spec'd): a genuinely-adaptive gain / anti-windup
+Not built. Candidate follow-ons if the controller goes live: keeper-settable / auto-tuned `k`, integral anti-windup on the clamp, and joint P(U)+integral gain calibration (they share the U signal). Revisit with real flow data.
 
 ---
 
