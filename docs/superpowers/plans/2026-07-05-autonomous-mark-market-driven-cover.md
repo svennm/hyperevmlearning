@@ -179,19 +179,43 @@ git push -u origin slice-autonomous-mark
 
 ## Phase 2 — Autonomous mark (`EverlastingBook`)
 
-### Task 3: `IVolSource` seam + `MockVol` + `vol` immutable
+### Task 3: `IVolSource` seam + `MockVol` (additive only — book ctor untouched)
 
 **Files:**
 - Create: `src/interfaces/IVolSource.sol`
 - Create: `src/mocks/MockVol.sol`
-- Modify: `src/RealizedVol.sol` (declare `is IVolSource`), `src/EverlastingBook.sol` (import `IVolSource`; `vol` → immutable ctor arg; delete `setVol`/`VolSet`)
+- Modify: `src/RealizedVol.sol` (declare `is IVolSource`)
+- Test: `test/MockVol.t.sol` (new)
+
+**Sequencing note:** this task is purely additive so the whole suite stays green. The `EverlastingBook`
+ctor change (`vol` → immutable `IVolSource` arg, delete `setVol`) lands in **Task 5**, atomically with the
+13-file test migration — otherwise the ctor change breaks every book test before they're migrated.
 
 **Interfaces:**
-- Produces: `interface IVolSource { function sigma() external view returns (uint256); function ready() external view returns (bool); function updateVol() external; }`. `MockVol` with `setSigma(uint256)`, `setReady(bool)`; `updateVol()` no-op. `EverlastingBook` ctor gains a trailing `IVolSource _vol` param; `vol` is `IVolSource public immutable`.
+- Produces: `interface IVolSource { function sigma() external view returns (uint256); function ready() external view returns (bool); function updateVol() external; }`. `MockVol` with `setSigma(uint256)`, `setReady(bool)`; `updateVol()` no-op. `RealizedVol is IVolSource` (its existing `sigma`/`ready`/`updateVol` already match — no logic change).
 
-- [ ] **Step 1: Write failing test** — `test/Book.adaptive.t.sol` (or a fresh `test/Book.vol.t.sol`): construct the book with a `MockVol`, assert `book.fairMark(Side.COVERED_CALL) > 0` for `setSigma(0.8e18)`, and that there is **no** `setVol` selector (compile-time — remove any `book.setVol(...)` call).
+- [ ] **Step 1: Write failing test**
 
-- [ ] **Step 2: Run, verify fail** — `forge build` fails (ctor arity / missing `IVolSource`).
+```solidity
+// test/MockVol.t.sol
+import {MockVol} from "../src/mocks/MockVol.sol";
+import {IVolSource} from "../src/interfaces/IVolSource.sol";
+import {RealizedVol} from "../src/RealizedVol.sol";
+function test_mockVol_reportsSetSigmaAndReady() public {
+    MockVol v = new MockVol();
+    v.setSigma(1.2e18); v.setReady(false);
+    assertEq(v.sigma(), 1.2e18);
+    assertEq(v.ready(), false);
+    IVolSource(address(v)).updateVol(); // no-op, no revert
+}
+function test_realizedVol_isIVolSource() public {
+    // compile-time proof RealizedVol satisfies the interface
+    IVolSource v = IVolSource(address(new RealizedVol(ISpotOracle(address(oracle)))));
+    v.ready();
+}
+```
+
+- [ ] **Step 2: Run, verify fail** — `forge test --mp test/MockVol.t.sol -vv` → FAIL (`IVolSource`/`MockVol` missing).
 
 - [ ] **Step 3: Implement**
 
@@ -216,15 +240,15 @@ contract MockVol is IVolSource {
     function updateVol() external {}
 }
 ```
-In `EverlastingBook.sol`: `import {IVolSource} from "./interfaces/IVolSource.sol";`, change field to `IVolSource public immutable vol;`, add `IVolSource _vol` as the final ctor param and `vol = _vol;` (require non-zero), replace `RealizedVol` type usages with `IVolSource`, delete `setVol` + `VolSet` + the `import {RealizedVol}`. `RealizedVol is IVolSource` (add to contract decl).
+In `src/RealizedVol.sol`: add `import {IVolSource} from "./interfaces/IVolSource.sol";` and `contract RealizedVol is IVolSource` (its `sigma()`/`ready()`/`updateVol()` already match; no logic change).
 
-- [ ] **Step 4: Run, verify pass** — `forge build` green; the new fairMark test passes. (Other book tests still fail to compile — fixed in Task 5's migration; if the reviewer wants green here, temporarily pass a `new RealizedVol(oracle)` in the untouched tests. Prefer to land Tasks 3-5 as a reviewed group.)
+- [ ] **Step 4: Run, verify pass** — `forge test` → whole suite green (additive only; book untouched).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/interfaces/IVolSource.sol src/mocks/MockVol.sol src/RealizedVol.sol src/EverlastingBook.sol test/
-git commit -m "feat(book): IVolSource seam + MockVol; vol becomes immutable ctor arg (drop setVol)"
+git add src/interfaces/IVolSource.sol src/mocks/MockVol.sol src/RealizedVol.sol test/MockVol.t.sol
+git commit -m "feat(vol): IVolSource seam + MockVol; RealizedVol implements it (additive)"
 ```
 
 ### Task 4: `_computedMark` + permissionless `accrue(side)`
@@ -321,14 +345,15 @@ git commit -m "feat(book): _computedMark + permissionless accrue() (mark = on-ch
 ### Task 5: Delete `postMark`/band/deviation, rewire `openLong`, migrate the 13 book test files
 
 **Files:**
-- Modify: `src/EverlastingBook.sol` (delete `postMark`, `MARK_BAND_BPS`, `MAX_MARK_DEV_BPS`, band block; `openLong` both sides call `accrue(side)` first, drop the `ss.mark>0`/stale-mark guards in favour of a post-accrue `require(ss.mark>0,"no mark")`; keep `keeper` field + `setKeeper` for cover-trigger role but remove keeper-gating from the mark path)
-- Modify (migrate): `test/Book.put.t.sol`, `test/Book.admin.t.sol`, `test/Book.call.open.t.sol`, `test/Book.call.close.t.sol`, `test/Book.callBacking.t.sol`, `test/Book.evmvault.integration.t.sol`, `test/Book.intrinsic.t.sol`, `test/Book.withdraw.t.sol`, `test/Book.reconcile.t.sol`, `test/Book.invariant.t.sol`, `test/Book.adaptive.t.sol`, `test/Book.markBand.t.sol`, `test/UtilPremium.t.sol`
+- Modify: `src/EverlastingBook.sol` — (a) **ctor**: `vol` → `IVolSource public immutable`, add final ctor param `IVolSource _vol` with `require(address(_vol)!=0)`, delete `setVol`/`VolSet`/`import {RealizedVol}` and replace `RealizedVol` type refs with `IVolSource`; (b) delete `postMark`, `MARK_BAND_BPS`, `MAX_MARK_DEV_BPS`, band block; (c) `openLong` both sides call `accrue(side)` first, drop the `ss.mark>0`/stale-mark guards in favour of a post-accrue `require(ss.mark>0,"no mark")`; keep `keeper` field + `setKeeper` for cover-trigger role but remove keeper-gating from the mark path
+- Modify (migrate): `test/Book.put.t.sol`, `test/Book.admin.t.sol`, `test/Book.call.open.t.sol`, `test/Book.call.close.t.sol`, `test/Book.callBacking.t.sol`, `test/Book.evmvault.integration.t.sol`, `test/Book.intrinsic.t.sol`, `test/Book.withdraw.t.sol`, `test/Book.reconcile.t.sol`, `test/Book.invariant.t.sol`, `test/Book.adaptive.t.sol`, `test/UtilPremium.t.sol`
+- Delete: `test/Book.markBand.t.sol` (band removed)
 
 **Interfaces:**
-- Produces: `openLong(Side, uint256)` — now auto-accrues; `postMark` **removed**. No band/deviation constants.
+- Produces: `EverlastingBook` ctor final arg `IVolSource _vol` (immutable `vol`); `openLong(Side, uint256)` now auto-accrues; `postMark` and `setVol` **removed**. No band/deviation constants.
 
 **Migration rule (apply to every listed test file):**
-1. Construct the book with a `MockVol` (`mockVol = new MockVol(); mockVol.setSigma(<σ>);`) passed as the final ctor arg. Set the oracle spot via `oracle.setSpotWad(<S>)`.
+1. Construct the book with a `MockVol` (`mockVol = new MockVol(); mockVol.setSigma(<σ>);`) passed as the **final ctor arg** (`new EverlastingBook(vault, oracle, keeper, Kput, Wput, Kcall, putCap, callCap, mockVol)`); delete any `book.setVol(...)` call. Set the oracle spot via `oracle.setSpotWad(<S>)`.
 2. Replace every `vm.prank(keeper); book.postMark(side, M);` (and bare `book.postMark(side, M)`) with `book.accrue(side);` **after** setting `oracle`/`mockVol` so `fairMark` equals the intended mark. To advance funding, `vm.warp(block.timestamp + n*FUNDING_PERIOD)` **then** `book.accrue(side)`.
 3. To create **markGain** (a "winning" close) drive the oracle, not the mark: for CALL raise `S` (`fairMark(CALL)` rises); for PUT lower `S`. Assert PnL against `book.fairMark(side)` / the stored mark read from `sideState`, not a literal.
 4. **Delete** `test/Book.markBand.t.sol` entirely (the band is gone) and any `MAX_MARK_DEV_BPS`/`"mark deviation"`/`"mark band"` assertions.
@@ -371,6 +396,7 @@ git commit -m "feat(book): remove keeper postMark + band/deviation; openLong aut
 **Files:**
 - Modify: `src/EverlastingBook.sol` (state vars `utilKappa`/`uMax`/`adaptiveK`/`uStar` → constants `UTIL_KAPPA`/`U_MAX`/`ADAPT_K`/`U_STAR`; delete `setUtilKappa`/`setUMax`/`setAdaptiveParams` + their events; ctor drops their seeding except `adaptiveMult=WAD`)
 - Test: `test/UtilPremium.t.sol`, `test/Book.adaptive.t.sol`
+- **Ripple:** turning `UTIL_KAPPA` on makes the P(U) surcharge **always-on** (was inert at κ=0). Any book test that asserts exact funding/close numbers at U>0 (e.g. `test/Book.call.close.t.sol`, `test/Book.put.t.sol`, `test/UtilPremium.t.sol`) may shift — run the FULL suite and update the affected numeric assertions. This is expected, not a regression.
 
 **Interfaces:**
 - Produces: constants `UTIL_KAPPA = 0.05e18`, `U_MAX = 0.8e18`, `ADAPT_K = 0.02e18`, `U_STAR = 0.5e18` (values chosen conservatively: κ small so P(U) is a gentle surcharge; uMax 80% survivability cap; k well under `MAX_ADAPT_K=0.1e18`). `_utilSurcharge`/`utilization`/`openLong` u-cap/`_updateAdaptiveMult` read the constants.
