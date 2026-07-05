@@ -4,3 +4,6 @@
 [submodule "lib/hyper-evm-lib"]
 	path = lib/hyper-evm-lib
 	url = https://github.com/hyperliquid-dev/hyper-evm-lib
+[submodule "lib/solady"]
+	path = lib/solady
+	url = https://github.com/Vectorized/solady
