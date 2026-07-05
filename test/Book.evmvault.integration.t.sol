@@ -53,6 +53,12 @@ contract BookEvmVaultIntegrationTest is Test {
     HyperCore         hyperCore;
 
     address ALICE = makeAddr("alice");
+    address constant BBO_ADDR = 0x000000000000000000000000000000000000080e;
+
+    function _mockBbo(uint64 bid, uint64 ask) internal {
+        vm.mockCall(BBO_ADDR, abi.encode(uint64(11035)),
+            abi.encode(PrecompileLib.Bbo({bid: bid, ask: ask})));
+    }
 
     function setUp() public {
         // ── HyperCore sim (offline) ──────────────────────────────────────────
@@ -91,7 +97,8 @@ contract BookEvmVaultIntegrationTest is Test {
         CoreSimulatorLib.setRevertOnFailure(true);
 
         // Owner (this) buys 100 HYPE cover from the Core float; settle the fill.
-        vault.buyCover(100e18, 15_000e6);
+        _mockBbo(SPOT_PX_RAW, SPOT_PX_RAW); // bid=ask=$100 — matches spotPx used by simulator
+        vault.buyCover(100e18, 15_000e6);  // worstCost at limit ~$100.50×100=$10050 < $15000
         CoreSimulatorLib.nextBlock();
         assertEq(vault.coverHype(), 100e18, "cover seeded: 100 HYPE");
 

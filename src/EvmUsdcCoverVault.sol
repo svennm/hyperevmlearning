@@ -56,8 +56,11 @@ contract EvmUsdcCoverVault is ICoverVault {
     /// @dev szDecimals=2: 0.01 HYPE minimum tradable increment = 1e16 WAD
     uint256 internal constant HYPE_TICK  = 1e16;
     uint256 internal constant WAD        = 1e18;
-    /// @dev 50 bps = 0.5% slippage buffer for marketable IOC orders
+    /// @dev 50 bps = 0.5% slippage buffer for marketable IOC orders (SELL side)
     uint256 internal constant SLIPPAGE_BPS = 50;
+    /// @dev Marketability buffer over the live best quote (bps). A FIXED constant — it does not set the
+    ///      price (the on-chain BBO does); it only guarantees the IOC crosses if the quote ticks.
+    uint256 internal constant COVER_CROSS_BPS = 50;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -164,21 +167,22 @@ contract EvmUsdcCoverVault is ICoverVault {
     /// @dev Places a marketable IOC spot buy on HYPE_SPOT_ASSET, funded from the EXISTING Core-USDC
     ///      float. If the float is short, the IOC simply won't fill — the keeper must
     ///      `bridgeUsdcToCore` first (bridge is async; do NOT try to bridge-and-buy atomically).
-    ///      limitPx = rawSpotPx × 100 × (10000 + SLIPPAGE_BPS) / 10000  (*1e8 order scale).
+    ///      limitPx = bbo.ask × 100 × (10000 + COVER_CROSS_BPS) / 10000  (*1e8 order scale).
+    ///      worstCost = _toUsdc(hypeWad × limitPxWad / WAD)  (H4: priced at LIMIT, not stale bid).
     ///      sz      = hypeWad / 1e10  (WAD → *1e8 order units).
     ///      ASYNC: coverHype() does NOT increase until the fill settles (≥1 Core block).
     function buyCover(uint256 hypeWad, uint256 maxUsdc) external onlyKeeper {
         require(hypeWad > 0, "qty=0");
-        uint64 rawPx  = PrecompileLib.spotPx(HYPE_SPOT_INDEX);
-        uint256 pxWad = uint256(rawPx) * 1e12;
-        // Guard: estimated cost at current price must not exceed caller's cap.
-        uint256 estCost = _toUsdc(hypeWad * pxWad / WAD);
-        require(estCost <= maxUsdc, "slippage");
-        // sz in *1e8 order units; revert if below minimum tradable tick.
+        PrecompileLib.Bbo memory q = PrecompileLib.bbo(uint64(HYPE_SPOT_ASSET));
+        require(q.ask > 0, "no ask");
+        // ask ×1e6 → order limitPx ×1e8 (×100), plus a tiny fixed cross buffer.
+        uint64 limitPx = uint64(uint256(q.ask) * 100 * (10000 + COVER_CROSS_BPS) / 10000);
+        // H4: worst-case spend at the LIMIT (not the stale bid) ≤ caller cap.
+        uint256 limitPxWad = uint256(limitPx) * 1e10;
+        uint256 worstCost  = _toUsdc(hypeWad * limitPxWad / WAD);
+        require(worstCost <= maxUsdc, "cost>max");
         uint64 sz = uint64(hypeWad / 1e10);
         require(sz > 0, "qty: below min tick");
-        // limitPx above current ask for marketable IOC fill.
-        uint64 limitPx = uint64(uint256(rawPx) * 100 * (10000 + SLIPPAGE_BPS) / 10000);
         CoreWriterLib.placeLimitOrder(
             HYPE_SPOT_ASSET, true, limitPx, sz, false, HLConstants.LIMIT_ORDER_TIF_IOC, ++cloidSeq
         );

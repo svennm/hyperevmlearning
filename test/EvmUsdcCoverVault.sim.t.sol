@@ -32,7 +32,8 @@ contract EvmUsdcCoverVaultSimTest is Test {
     EvmUsdcCoverVault vault;
     HyperCore         hyperCore;
 
-    address constant STRANGE = address(0x57A);
+    address constant STRANGE  = address(0x57A);
+    address constant BBO_ADDR = 0x000000000000000000000000000000000000080e;
 
     function setUp() public {
         hyperCore = CoreSimulatorLib.init();
@@ -59,6 +60,11 @@ contract EvmUsdcCoverVaultSimTest is Test {
         CoreSimulatorLib.setRevertOnFailure(true);
     }
 
+    function _mockBbo(uint64 bid, uint64 ask) internal {
+        vm.mockCall(BBO_ADDR, abi.encode(uint64(11035)),
+            abi.encode(PrecompileLib.Bbo({bid: bid, ask: ask})));
+    }
+
     // ── Two-layer poolUsdc ────────────────────────────────────────────────────
 
     /// @notice poolUsdc = EVM ERC20 balance + Core-USDC float.
@@ -73,10 +79,11 @@ contract EvmUsdcCoverVaultSimTest is Test {
     // ── buyCover consumes the Core float; EVM untouched ───────────────────────
 
     function test_sim_buyCover_consumesCoreFloat() public {
+        _mockBbo(25_000_000, 25_000_000); // bid=ask=$25 — matches spotPx used by simulator
         usdc.mint(address(vault), 500e6); // EVM buffer that must NOT move on a cover buy
         uint256 poolBefore = vault.poolUsdc(); // 1500e6
 
-        vault.buyCover(1e18, 30e6); // 1 HYPE, est $25
+        vault.buyCover(1e18, 30e6); // 1 HYPE, worstCost at limit ~$25.125 < $30
         CoreSimulatorLib.nextBlock();
 
         assertEq(vault.coverHype(), 1e18, "cover = 1 HYPE after fill");
@@ -91,8 +98,9 @@ contract EvmUsdcCoverVaultSimTest is Test {
     }
 
     function test_sim_buyCover_slippageReverts() public {
-        vm.expectRevert("slippage");
-        vault.buyCover(1e18, 24e6); // est $25 > cap $24
+        _mockBbo(25_000_000, 25_000_000); // worstCost at limit ~$25.125 > cap $24 → revert
+        vm.expectRevert("cost>max");
+        vault.buyCover(1e18, 24e6); // worst-case cost at limit ($25.125) > cap $24
     }
 
     function test_sim_buyCover_onlyKeeper() public {
@@ -140,6 +148,7 @@ contract EvmUsdcCoverVaultSimTest is Test {
     // ── coverEquity + cloidSeq ────────────────────────────────────────────────
 
     function test_sim_coverEquity_afterBuy() public {
+        _mockBbo(25_000_000, 25_000_000);
         vault.buyCover(2e18, 60e6);
         CoreSimulatorLib.nextBlock();
         // 2 HYPE × $25 = $50
@@ -147,6 +156,7 @@ contract EvmUsdcCoverVaultSimTest is Test {
     }
 
     function test_sim_cloidSeq_increments() public {
+        _mockBbo(25_000_000, 25_000_000);
         uint128 s0 = vault.cloidSeq();
         vault.buyCover(1e18, 30e6);
         assertEq(vault.cloidSeq(), s0 + 1, "cloid +1 on buy");

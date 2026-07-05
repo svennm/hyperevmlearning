@@ -214,4 +214,40 @@ contract EvmUsdcCoverVaultUnitTest is Test {
         assertEq(v.coverEquityUsdc(), 0);
         assertEq(v.spotPxUsdc(),      25e18);
     }
+
+    // ── buyCover: live BBO-driven pricing (Task 1 — trust-min) ───────────────
+
+    address constant BBO_ADDR = 0x000000000000000000000000000000000000080e;
+
+    function _mockBbo(uint64 bid, uint64 ask) internal {
+        vm.mockCall(BBO_ADDR, abi.encode(uint64(11035)),
+            abi.encode(PrecompileLib.Bbo({bid: bid, ask: ask})));
+    }
+
+    function test_buyCover_crossesLiveAsk_dislocatedBook() public {
+        // bid $33, ask $62.989 (the real testnet dislocation)
+        _mockBbo(33_000_000, 62_989_000);
+        CoreSimulatorLib.forceSpotBalance(address(vault), USDC_TOKEN, 1000e8); // fund Core float
+        vm.prank(KEEPER);
+        vault.buyCover(0.2e18, 14e6); // 0.2 HYPE, cap $14 (0.2 * ~$63.3 limit ≈ $12.7)
+        CoreSimulatorLib.nextBlock();
+        assertGt(vault.coverHype(), 0, "cover acquired crossing the ask");
+    }
+
+    function test_buyCover_costGuardPricedAtLimit_notStaleBid() public {
+        // H4: stale-bid estimate ($33*0.2=$6.6) would pass a $7 cap, but the ask-priced
+        // worst case ($63*0.2≈$12.7) must exceed it and revert.
+        _mockBbo(33_000_000, 62_989_000);
+        CoreSimulatorLib.forceSpotBalance(address(vault), USDC_TOKEN, 1000e8);
+        vm.prank(KEEPER);
+        vm.expectRevert(bytes("cost>max"));
+        vault.buyCover(0.2e18, 7e6);
+    }
+
+    function test_buyCover_revertsOnZeroAsk() public {
+        _mockBbo(33_000_000, 0);
+        vm.prank(KEEPER);
+        vm.expectRevert(bytes("no ask"));
+        vault.buyCover(0.2e18, 100e6);
+    }
 }
