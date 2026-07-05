@@ -31,11 +31,12 @@ contract BookMarkBandTest is Test {
         );
         vol = new RealizedVol(oracle);
         book.setVol(vol);
-        vol.updateVol();      // seed @ 100
-        skip(3600);
-        oracle.set(101e18);   // ~1% move
-        vol.updateVol();      // ready()
-        oracle.set(100e18);   // clean ATM for fair
+        vol.updateVol();                                   // seed @ 100
+        // READY_SAMPLES(3) folds of small moves so vol.ready() and the band activates.
+        skip(3600); oracle.set(101e18); vol.updateVol();   // sample 1
+        skip(3600); oracle.set(100e18); vol.updateVol();   // sample 2
+        skip(3600); oracle.set(101e18); vol.updateVol();   // sample 3 → ready()
+        oracle.set(100e18);                                // clean ATM for fair
     }
 
     function _post(EverlastingBook.Side s, uint256 m) internal {
@@ -107,6 +108,29 @@ contract BookMarkBandTest is Test {
         _post(PUT, intr);
         (uint256 m,,,,) = book.sideState(uint8(PUT));
         assertEq(m, intr);
+    }
+
+    /// @notice F1: postMark pings updateVol() so σ is sampled at every mark (a spike present at
+    ///         mark-time is folded in), reducing the reliance on a separate off-chain observer.
+    function test_postMark_pingsUpdateVol() public {
+        uint256 s0 = vol.samples();
+        skip(3600);
+        oracle.set(110e18);              // +10% spike live at mark time
+        uint256 sigBefore = vol.sigma();
+        _post(PUT, book.fairMark(PUT));  // keeper posts → postMark pings updateVol → folds the spike
+        assertEq(vol.samples(), s0 + 1, "postMark folded a vol sample");
+        assertGt(vol.sigma(), sigBefore, "sigma rose from the spike captured at mark time");
+    }
+
+    /// @notice The ping is AFTER the band check: it never widens/moves THIS post's band, only refreshes
+    ///         σ for future marks. Same-block reposts see a stable band (intra-period record, no fold).
+    function test_ping_doesNotDisturbThisPostsBand() public {
+        uint256 fair = book.fairMark(PUT);
+        _post(PUT, fair);
+        _post(PUT, fair * 10500 / 10000); // +5% inside band — unaffected by the end-of-call ping
+        vm.prank(keeper);
+        vm.expectRevert("mark band");
+        book.postMark(PUT, fair * 11500 / 10000); // +15% still rejected
     }
 
     /// @notice Bootstrap: with no vol wired, postMark falls back to the relative deviation cap.

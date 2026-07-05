@@ -626,6 +626,14 @@ contract EverlastingBook {
         ss.lastMarkTime = block.timestamp;
         ss.lastIntrinsic = intr;
         emit MarkPosted(side, newMark, ss.cumFunding);
+
+        // F1 (σ liveness): sample σ at every mark so a spike present at mark-time is folded in,
+        // reducing reliance on a separate off-chain observer. Placed AFTER the band check above so
+        // it can never move THIS post's band — only refresh σ for future marks. try/catch so a
+        // transient vol revert (e.g. px=0) can never brick the keeper's mark.
+        if (address(vol) != address(0)) {
+            try vol.updateVol() {} catch {}
+        }
     }
 
     // ── pendingFunding ────────────────────────────────────────────────────────

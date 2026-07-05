@@ -196,18 +196,24 @@ contract BookInvariantHandler is Test {
     function postMarkCall(uint256 m) external {
         uint256 spot = oracle.spotWad();
         uint256 intr = spot > KCALL ? spot - KCALL : 0;       // call intrinsic (uncapped)
+        // Coverage (auditor gap #1): the on-chain fair-value band lets a keeper post a call mark up to
+        // ~1.1·spot (above the underlying). A winning close of such a mark needs a payout g that can
+        // EXCEED the cover-sale proceeds, forcing the pool to source the shortfall from poolFree() and
+        // hitting the fail-closed `require(poolFree() >= g)` (src:748). Cap at 1.1·spot (not spot) so the
+        // 128k-call conservation fuzz actually drives that branch — proving no underflow / no leak there.
+        uint256 scap = spot + spot / 10;                       // band ceiling (+10%)
         (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(CALL_U);
 
         uint256 lo;
         uint256 hi;
         if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) {
             lo = intr;
-            hi = spot > intr ? spot : intr;                    // cap at spot: call <= underlying
+            hi = scap > intr ? scap : intr;
         } else {
             uint256 dhi = mark + mark * 2000 / 10000;
             uint256 rawlo = mark >= mark * 2000 / 10000 ? mark - mark * 2000 / 10000 : 0;
             lo = rawlo > intr ? rawlo : intr;
-            hi = dhi < spot ? dhi : spot;                      // cap at spot
+            hi = dhi < scap ? dhi : scap;
         }
         if (hi < lo) hi = lo;
         m = bound(m, lo, hi);

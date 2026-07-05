@@ -28,6 +28,8 @@ contract RealizedVol {
     uint256 public constant PERIODS_PER_YEAR = 8760;
     uint256 public constant SIGMA_MIN        = 0.20e18;  // 20% annual floor
     uint256 public constant SIGMA_MAX        = 3.0e18;   // 300% annual ceiling
+    /// @notice F1: min folded periods before ready() — the band never activates on a thin 1-sample σ.
+    uint256 public constant READY_SAMPLES    = 3;
     uint256 internal constant WAD            = 1e18;
 
     ISpotOracle public immutable oracle;
@@ -96,8 +98,9 @@ contract RealizedVol {
         return s;
     }
 
-    /// @notice True once at least one period has folded (post-seed).
+    /// @notice True once at least READY_SAMPLES periods have folded (post-seed). Gating on N>1 keeps a
+    ///         thin, easily-biased 1-sample σ from activating the book's fair-value band (F1).
     function ready() external view returns (bool) {
-        return samples >= 1;
+        return samples >= READY_SAMPLES;
     }
 }

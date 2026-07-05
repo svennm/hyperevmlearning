@@ -19,16 +19,22 @@ contract RealizedVolTest is Test {
         vol.updateVol(); // seed
     }
 
-    function test_seed_thenReady() public {
+    /// @dev F1: ready() gates on samples >= READY_SAMPLES so the band never activates on a thin
+    ///      1-sample σ (which could be biased by a single fold).
+    function test_ready_requiresNSamples() public {
         assertFalse(vol.ready());
         _seed(100e18);
         assertEq(vol.samples(), 0);
         assertFalse(vol.ready()); // seed is not a sample
-        skip(3600);
-        oracle.set(101e18);
-        vol.updateVol();
-        assertEq(vol.samples(), 1);
-        assertTrue(vol.ready());
+        uint256 n = vol.READY_SAMPLES();
+        for (uint256 i = 1; i <= n; i++) {
+            skip(3600);
+            oracle.set(100e18 + (i % 2) * 1e18); // small alternating moves
+            vol.updateVol();
+            assertEq(vol.samples(), i);
+            if (i < n) assertFalse(vol.ready(), "not ready before N samples");
+        }
+        assertTrue(vol.ready(), "ready at N samples");
     }
 
     function test_sigma_inBounds() public {

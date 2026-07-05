@@ -33,10 +33,11 @@ contract BookAdaptiveTest is Test {
         );
         vol = new RealizedVol(oracle);
         book.setVol(vol);
-        vol.updateVol();     // seed @ 100
-        skip(3600);
-        oracle.set(101e18);
-        vol.updateVol();     // ready()
+        vol.updateVol();                                   // seed @ 100
+        // READY_SAMPLES(3) folds so the band is ACTIVE (adaptive controller tested on the real path).
+        skip(3600); oracle.set(101e18); vol.updateVol();   // sample 1
+        skip(3600); oracle.set(100e18); vol.updateVol();   // sample 2
+        skip(3600); oracle.set(101e18); vol.updateVol();   // sample 3 → ready()
         oracle.set(100e18);  // clean ATM
     }
 
@@ -63,6 +64,7 @@ contract BookAdaptiveTest is Test {
 
         assertEq(book.adaptiveMult(PUT_U), 1e18, "mult never moves while k=0");
         assertEq(book.fairMark(PUT), fairBefore, "fair unchanged (sigma + mult stable)");
+        assertEq(book.effectiveSigma(PUT), vol.sigma(), "mult==WAD means no sigma shift");
     }
 
     // ── over-target demand richens the mark (the integral climbs) ───────────────
@@ -80,6 +82,7 @@ contract BookAdaptiveTest is Test {
 
         assertGt(book.adaptiveMult(PUT_U), multBefore, "mult climbed");
         assertGt(book.fairMark(PUT), fairBefore, "mark richened");
+        assertGt(book.effectiveSigma(PUT), vol.sigma(), "mult>WAD lifts sigma above realized");
         // 3 periods · k·(0.6−0.5) = 0.05·0.1 = 0.005 ⇒ +0.015
         assertApproxEqAbs(book.adaptiveMult(PUT_U), 1e18 + 0.015e18, 1e15);
     }
