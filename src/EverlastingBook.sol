@@ -705,6 +705,13 @@ contract EverlastingBook {
     ///      holds: poolUsdc falls by `amt`, poolFree falls by `amt`, totalCollateral/putEscrow flat.
     function lpWithdraw(uint256 amt) external onlyOwner {
         require(poolFree() >= amt, "pool-free");
+        // Call-backing guard (M1): when covered calls are open but the cover no longer backs them 1:1
+        // — i.e. after emergencyUnwindCover has converted cover→poolFree — that poolFree IS the open
+        // call-winners' backing and must NOT be withdrawable, or the owner could strand their payouts.
+        // Normal operation is unaffected: the cover-gate holds (coverHype ≥ callNetWritten) so this
+        // passes; it only bites in the post-unwind window until those under-backed calls resolve.
+        uint256 callNW = sideState[uint8(Side.COVERED_CALL)].netWritten;
+        require(callNW == 0 || vault.coverHype() >= callNW, "call backing");
         vault.payoutUsdc(msg.sender, amt);
         emit LpWithdrawn(msg.sender, amt);
     }
