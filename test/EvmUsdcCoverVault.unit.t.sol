@@ -224,8 +224,9 @@ contract EvmUsdcCoverVaultUnitTest is Test {
             abi.encode(PrecompileLib.Bbo({bid: bid, ask: ask})));
     }
 
-    function test_buyCover_crossesLiveAsk_dislocatedBook() public {
-        // bid $33, ask $62.989 (the real testnet dislocation)
+    function test_buyCover_readsBbo_underCap_acquiresCover() public {
+        // NOTE: true dislocated-ask crossing is a fork-only property (live orderbook).
+        // This unit test only verifies that the bbo read path is consumed, doesn't revert, and cover is acquired within the cap.
         _mockBbo(33_000_000, 62_989_000);
         CoreSimulatorLib.forceSpotBalance(address(vault), USDC_TOKEN, 1000e8); // fund Core float
         vm.prank(KEEPER);
