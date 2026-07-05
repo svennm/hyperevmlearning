@@ -303,6 +303,20 @@ contract BookInvariantHandler is Test {
         try book.unpause() {} catch {}
     }
 
+    // ── Utilization-premium params: exercise the P(U) surcharge under the conservation fuzz ──
+    //
+    // The handler owns the book, so it may set κ/uMax. Turning the surcharge ON across the campaign
+    // proves usdcConservation holds with the surcharge path live (the surcharge only ever INCREASES
+    // funding owed = trader→pool, floored at collateral on the loss branch, so it can never underflow
+    // poolFree — but the fuzz verifies that structurally rather than by argument).
+
+    function setUtilParams(uint256 kSeed, uint256 uSeed) external {
+        uint256 k = bound(kSeed, 0, book.MAX_UTIL_KAPPA());
+        uint256 u = bound(uSeed, 1, book.MAX_UMAX());
+        try book.setUtilKappa(k) {} catch {}
+        try book.setUMax(u) {} catch {}
+    }
+
     // ── Spot driver: sweep across [1, 1000*Kcall] AND crash toward 0 ──────────
 
     function moveSpot(uint256 s) external {

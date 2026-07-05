@@ -19,6 +19,17 @@ contract EverlastingBook {
     uint256 public constant MAX_MARK_AGE     = 7200;   // seconds (2 hours)
     uint256 public constant MAX_MARK_DEV_BPS = 2000;   // 20% max deviation per update
 
+    // ── Utilization-premium funding (P(U), AmPO-style) ────────────────────────
+
+    /// @notice WAD scalar (1e18).
+    uint256 public constant WAD             = 1e18;
+    /// @notice Ceiling on the funding surcharge multiplier κ (WAD).
+    uint256 public constant MAX_UTIL_KAPPA  = 1e18;
+    /// @notice Ceiling on the hard utilization cap uMax (0.95·WAD) — keeps (WAD−U)^3 > 0.
+    uint256 public constant MAX_UMAX        = 95e16;
+    /// @notice Clamp on the (divergent) call-side surcharge shape (WAD).
+    uint256 public constant MAX_UTIL_SHAPE  = 1000e18;
+
     // ── Immutables ─────────────────────────────────────────────────────────────
 
     /// @notice Vault holding all USDC/HYPE collateral. The book holds no cash itself.
@@ -111,6 +122,15 @@ contract EverlastingBook {
     /// @dev Maintained incrementally on every collateral mutation so poolFree() stays O(1).
     uint256 public totalCollateral;
 
+    // ── Utilization-premium params (owner-set, hard-capped; P(U)) ──────────────
+
+    /// @notice Funding surcharge multiplier κ (WAD). Default 0 ⇒ surcharge OFF until owner activates.
+    uint256 public utilKappa;
+
+    /// @notice Hard utilization cap (WAD). Seeded to WAD in the constructor ⇒ no extra cap until the
+    ///         owner tightens it. 0 would brick openLong, so setUMax rejects 0 and the ctor seeds WAD.
+    uint256 public uMax;
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     event Deposited(Side indexed side, address indexed trader, uint256 amt);
@@ -133,6 +153,10 @@ contract EverlastingBook {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     /// @notice Emitted by emergencyUnwindCover; hypeWad is the tick-floored amount sold.
     event EmergencyUnwind(uint256 hypeWad);
+    /// @notice Emitted when the owner changes the utilization surcharge multiplier κ.
+    event UtilKappaSet(uint256 oldKappa, uint256 newKappa);
+    /// @notice Emitted when the owner changes the hard utilization cap uMax.
+    event UMaxSet(uint256 oldUMax, uint256 newUMax);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -162,6 +186,7 @@ contract EverlastingBook {
         Kcall            = _Kcall;
         putCapNotional   = _putCapNotional;
         callCapNotional  = _callCapNotional;
+        uMax             = WAD; // fail-safe: 0 would brick openLong's u-cap
     }
 
     // ── Modifiers (T8) ───────────────────────────────────────────────────────
@@ -183,6 +208,24 @@ contract EverlastingBook {
         require(newKeeper != address(0), "keeper=0");
         emit KeeperChanged(keeper, newKeeper);
         keeper = newKeeper;
+    }
+
+    /// @notice Set the funding surcharge multiplier κ (WAD). Owner only; hard-capped at MAX_UTIL_KAPPA.
+    ///         κ=0 disables the surcharge (funding reverts to pure mark−intrinsic).
+    function setUtilKappa(uint256 newKappa) external onlyOwner {
+        require(newKappa <= MAX_UTIL_KAPPA, "kappa>max");
+        emit UtilKappaSet(utilKappa, newKappa);
+        utilKappa = newKappa;
+    }
+
+    /// @notice Set the hard utilization cap uMax (WAD). Owner only; must be in (0, MAX_UMAX].
+    ///         Bounds U ≤ uMax at open, which enforces the survivability cap AND keeps the divergent
+    ///         call surcharge curve finite. Never settable to 0 (would brick openLong).
+    function setUMax(uint256 newUMax) external onlyOwner {
+        require(newUMax > 0, "uMax=0");
+        require(newUMax <= MAX_UMAX, "uMax>max");
+        emit UMaxSet(uMax, newUMax);
+        uMax = newUMax;
     }
 
     /// @notice Initiate a 2-step ownership transfer. Does NOT change owner until acceptOwnership().
@@ -261,6 +304,48 @@ contract EverlastingBook {
         return s > Kcall ? s - Kcall : 0;
     }
 
+    // ── Utilization surcharge (P(U), AmPO-style; on-chain, references no oracle) ──
+
+    /// @notice Current utilization U = netWritten/cap for the given side (WAD, ∈[0,WAD]).
+    /// @dev Internal pool state only (open interest over capacity) — no price input.
+    function utilization(Side side) public view returns (uint256 U) {
+        uint256 cap = side == Side.PUT ? putCapNotional : callCapNotional;
+        if (cap == 0) return 0;
+        U = sideState[uint8(side)].netWritten * WAD / cap;
+        if (U > WAD) U = WAD;
+    }
+
+    /// @notice Per-period funding surcharge κ·P(U) for the given side (WAD). PUT: P=U (linear,
+    ///         ceiling at U=1). CALL: P=2U/(1−U)^3 (divergent), clamped at MAX_UTIL_SHAPE. Returns 0
+    ///         when utilKappa==0 or U==0. Purely a function of internal state — references no oracle.
+    /// @dev WAD math: shape_call = 2·U·WAD^3/(WAD−U)^3, rescaled by (1e6)^3=1e18 in the denominator so
+    ///      intermediates stay < 2^256 and near-saturation rounds the denominator to 0 → clamp. The
+    ///      hard uMax cap + MAX_UMAX keep U<WAD in normal flow; the clamp is belt-and-suspenders.
+    function _utilSurcharge(Side side) internal view returns (uint256) {
+        if (utilKappa == 0) return 0; // no-op fast path: change is inert until owner activates
+        uint256 U = utilization(side);
+        if (U == 0) return 0;
+
+        uint256 shape;
+        if (side == Side.PUT) {
+            shape = U; // linear: P_put(U) = U
+        } else if (U >= WAD) {
+            shape = MAX_UTIL_SHAPE;
+        } else {
+            // forge-lint: disable-next-line(divide-before-multiply) -- intentional rescale-then-cube
+            uint256 denom = (WAD - U) / 1e6;
+            denom = denom * denom * denom; // = (WAD−U)^3 / 1e18
+            if (denom == 0) {
+                shape = MAX_UTIL_SHAPE; // near-saturation: denom rounded to 0 → clamp
+            } else {
+                uint256 num = 2 * U * 1e36; // = 2·U·WAD^3 / 1e18; ≤ 2e54 < 2^256
+                shape = num / denom;        // = 2·U·WAD^3 / (WAD−U)^3
+                if (shape > MAX_UTIL_SHAPE) shape = MAX_UTIL_SHAPE;
+            }
+        }
+        return utilKappa * shape / WAD;
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// @dev WAD → USDC 6dp. Matches house style from EverlastingMarket / CoveredCallMarket.
@@ -306,6 +391,9 @@ contract EverlastingBook {
             putEscrow += im;
             ps.netWritten += qty;
             require(ps.netWritten <= putCapNotional, "cap");        // WAD cap on open put qty
+            // Hard utilization cap: netWritten ≤ uMax·cap. Overflow-safe: netWritten·WAD ≤ ~1e38.
+            // forge-lint: disable-next-line(divide-before-multiply) -- intentional cross-multiply
+            require(ps.netWritten * WAD <= uMax * putCapNotional, "u-cap");
 
             positions[sp][msg.sender] = Position(qty, ps.mark, ps.cumFunding);
             emit Opened(Side.PUT, msg.sender, qty, ps.mark);
@@ -325,6 +413,9 @@ contract EverlastingBook {
         // D3 pre-funded model: read vault on-chain (not optimistic local netWritten)
         require(vault.coverHype() >= ss.netWritten + qty, "cover");
         require(ss.netWritten + qty <= callCapNotional, "cap");
+        // Hard utilization cap: (netWritten+qty) ≤ uMax·cap. Overflow-safe: ·WAD ≤ ~1e38.
+        // forge-lint: disable-next-line(divide-before-multiply) -- intentional cross-multiply
+        require((ss.netWritten + qty) * WAD <= uMax * callCapNotional, "u-cap");
 
         ss.netWritten += qty;
         positions[uint8(side)][msg.sender] = Position(qty, ss.mark, ss.cumFunding);
@@ -361,6 +452,7 @@ contract EverlastingBook {
             if (periods > 0) {
                 // F3: contemporaneous lastIntrinsic from the prior mark time
                 uint256 f = ss.mark >= ss.lastIntrinsic ? ss.mark - ss.lastIntrinsic : 0;
+                f += _utilSurcharge(side); // P(U): endogenous concentration surcharge (0 when κ=0)
                 ss.cumFunding += f * periods;
             }
         }
