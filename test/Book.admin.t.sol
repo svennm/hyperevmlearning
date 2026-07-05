@@ -5,25 +5,31 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookAdminTest
 /// @notice Task 8 — admin controls (setKeeper, 2-step ownership, pause, emergency unwind),
-///         LP-gating enforcement, and a precision round-trip conservation proof.
+///         LP-gating enforcement, and a precision round-trip conservation proof. Migrated to the
+///         autonomous mark (Task 5): there is no keeper postMark — the mark is the on-chain computed
+///         fair value, refreshed permissionlessly via accrue and driven for tests by the oracle.
 ///
 ///   Key properties proved:
-///     1. setKeeper: owner-gated; updates keeper; old keeper can no longer postMark.
+///     1. setKeeper: owner-gated; updates keeper; emits KeeperChanged. (The keeper no longer gates
+///        any price path — the mark is autonomous — so there is no postMark-authority to check.)
 ///     2. 2-step ownership: transferOwnership sets pendingOwner only; acceptOwnership promotes;
 ///        stray acceptOwnership reverts; owner unchanged until accept (no single-tx loss).
-///     3. Pause: blocks openLong on BOTH sides; all exit paths (close/settle/withdraw/
-///        lpWithdraw/postMark/deposit) work while paused — pause is NOT a fund trap.
+///     3. Pause: blocks openLong on BOTH sides; all exit paths (close/settle/withdraw/lpWithdraw/
+///        accrue/deposit) work while paused — pause is NOT a fund trap.
 ///     4. emergencyUnwindCover: owner + paused only; sells tick-floored cover; sub-tick dust stays.
 ///     5. lpDeposit/lpWithdraw: onlyOwner (T8 M3 fix — closes the permissionless-LP withdrawal gap).
 ///     6. Precision round-trip: pool equity (poolFree + putEscrow + coverEquityUsdc) changes by
-///        exactly the trader's net pnl over a buy-cover → openLong → postMark → close sequence.
-///        No op creates or destroys value (±1 unit USDC tolerance for _toUsdc truncation).
+///        exactly the trader's net pnl over a buy-cover → openLong → accrue → close sequence. The
+///        mark is moved by the ORACLE (cover px kept fixed), so no op creates or destroys value
+///        (±1 unit USDC tolerance for _toUsdc truncation).
 contract BookAdminTest is Test {
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     EverlastingBook book;
 
     address constant ALICE   = address(0xA11CE);
@@ -35,8 +41,6 @@ contract BookAdminTest is Test {
     uint256 constant WPUT     =  50e18;
     uint256 constant KCALL    = 120e18;
     uint256 constant HYPE_PX  = 100e18;
-    uint256 constant CALL_MARK = 5e18;
-    uint256 constant PUT_MARK  = 20e18;
 
     EverlastingBook.Side private constant CALL = EverlastingBook.Side.COVERED_CALL;
     EverlastingBook.Side private constant PUT  = EverlastingBook.Side.PUT;
@@ -55,10 +59,12 @@ contract BookAdminTest is Test {
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol();
         book   = new EverlastingBook(
             vault, oracle, KEEPER,
             KPUT, WPUT, KCALL,
-            10_000e18, 10_000e18
+            10_000e18, 10_000e18,
+            mockVol
         );
         oracle.set(HYPE_PX);
         vault.setMockPx(HYPE_PX);
@@ -74,6 +80,10 @@ contract BookAdminTest is Test {
     /// @dev Pool total equity: free USDC + locked put escrow + mark-to-market value of cover HYPE.
     function _equity() internal view returns (uint256) {
         return book.poolFree() + book.putEscrow() + vault.coverEquityUsdc();
+    }
+
+    function _mark(EverlastingBook.Side side) internal view returns (uint256 m) {
+        (m,,,,) = book.sideState(uint8(side));
     }
 
     // ── setKeeper ────────────────────────────────────────────────────────────
@@ -95,15 +105,6 @@ contract BookAdminTest is Test {
         emit KeeperChanged(KEEPER, newK);
         book.setKeeper(newK);
         assertEq(book.keeper(), newK, "keeper updated");
-
-        // Old keeper can no longer postMark
-        vm.prank(KEEPER);
-        vm.expectRevert(bytes("only keeper"));
-        book.postMark(CALL, CALL_MARK);
-
-        // New keeper can
-        vm.prank(newK);
-        book.postMark(CALL, CALL_MARK); // no revert
     }
 
     // ── 2-step ownership ─────────────────────────────────────────────────────
@@ -183,21 +184,17 @@ contract BookAdminTest is Test {
     }
 
     function test_pause_blocks_openLong_call() public {
-        vm.prank(KEEPER);
-        book.postMark(CALL, CALL_MARK);
         vm.prank(ALICE);
         book.deposit(CALL, 10e6);
 
         book.pause();
 
         vm.prank(ALICE);
-        vm.expectRevert(bytes("paused"));
+        vm.expectRevert(bytes("paused")); // whenNotPaused reverts before the auto-accrue
         book.openLong(CALL, 1e18);
     }
 
     function test_pause_blocks_openLong_put() public {
-        vm.prank(KEEPER);
-        book.postMark(PUT, PUT_MARK);
         vm.prank(ALICE);
         book.deposit(PUT, 50e6);
 
@@ -209,15 +206,13 @@ contract BookAdminTest is Test {
     }
 
     function test_unpause_restores_openLong() public {
-        vm.prank(KEEPER);
-        book.postMark(CALL, CALL_MARK);
         vm.prank(ALICE);
         book.deposit(CALL, 10e6);
         book.pause();
         book.unpause();
 
         vm.prank(ALICE);
-        book.openLong(CALL, 1e18); // must not revert
+        book.openLong(CALL, 1e18); // must not revert — mark auto-refreshed
         (uint256 qty,,) = book.positions(CALL_U, ALICE);
         assertEq(qty, 1e18, "position opened after unpause");
     }
@@ -228,8 +223,6 @@ contract BookAdminTest is Test {
     ///      Proves: pause is a de-risk switch, not a fund trap.
     function test_pause_does_not_trap_funds_call() public {
         // Setup: open a call position for ALICE
-        vm.prank(KEEPER);
-        book.postMark(CALL, CALL_MARK);
         uint256 im = 10e6;
         vm.prank(ALICE);
         book.deposit(CALL, im);
@@ -243,10 +236,9 @@ contract BookAdminTest is Test {
         book.pause();
         assertTrue(book.paused(), "market paused");
 
-        // Keeper can still post a mark for fair settlement
+        // The mark can still be refreshed permissionlessly for fair settlement while paused.
         vm.warp(block.timestamp + 1800);
-        vm.prank(KEEPER);
-        book.postMark(CALL, CALL_MARK); // no revert while paused
+        book.accrue(CALL); // no revert while paused
 
         // ALICE can still close
         vm.prank(ALICE);
@@ -271,11 +263,11 @@ contract BookAdminTest is Test {
         assertEq(book.traderCollateral(CALL_U, ALICE), 10e6, "deposit credited while paused");
     }
 
-    /// @dev postMark works while paused (keeper can mark for fair settlement).
-    function test_postMark_works_while_paused() public {
+    /// @dev accrue works while paused (mark can be refreshed for fair settlement). Replaces the old
+    ///      keeper "postMark works while paused" — accrue is now the permissionless maintenance path.
+    function test_accrue_works_while_paused() public {
         book.pause();
-        vm.prank(KEEPER);
-        book.postMark(CALL, CALL_MARK); // no revert
+        book.accrue(CALL); // no revert
     }
 
     /// @dev lpWithdraw (owner) works while paused.
@@ -303,7 +295,6 @@ contract BookAdminTest is Test {
     function test_emergencyUnwind_sells_floored_cover_emits() public {
         uint256 coverBefore = vault.coverHype(); // 500e18 from setUp (tick-aligned)
         assertGt(coverBefore, 0, "has cover");
-        // 500e18 is already tick-aligned (500e18 / 1e16 * 1e16 == 500e18), so expectedSell == coverBefore
         uint256 expectedSell = (coverBefore / 1e16) * 1e16;
         uint256 expectedDust = coverBefore - expectedSell;
 
@@ -313,25 +304,23 @@ contract BookAdminTest is Test {
         book.emergencyUnwindCover();
 
         assertEq(vault.coverHype(), expectedDust, "only sub-tick dust remains");
-        // Pool USDC increased by the cover proceeds
         assertGt(vault.poolUsdc(), 0, "proceeds credited to pool");
     }
 
     /// @notice C1 regression: after emergencyUnwindCover, two open winning covered-call positions
     ///         can both close successfully, each paid their gain from poolFree (replenished by the
-    ///         cover-sale proceeds). Fails on old maxSell (checked-underflow revert) and passes
-    ///         with the clamped fix. Conservation identity holds after each close.
+    ///         cover-sale proceeds). Both positions win by DRIVING THE ORACLE UP before the unwind.
+    ///         Conservation identity holds after each close.
     function test_emergencyUnwind_winning_calls_can_close() public {
-        // ── Open two winning CALL positions ────────────────────────────────
-        vm.prank(KEEPER);
-        book.postMark(CALL, CALL_MARK);  // 5e18
+        // ── Open two CALL positions at the S=100 computed mark ─────────────────
+        book.accrue(CALL);
+        uint256 entry = _mark(CALL);
 
         uint256 qtyA = 1e18;  // 1 HYPE for ALICE
-        uint256 qtyB = 2e18;  // 2 HYPE for BOB — ensures two distinct netWritten contributors
+        uint256 qtyB = 2e18;  // 2 HYPE for BOB — two distinct netWritten contributors
 
-        // IM = _toUsdc(qty * mark / 1e18) + buffer
-        uint256 imA = qtyA * CALL_MARK / 1e18 / 1e12 + 5e6;
-        uint256 imB = qtyB * CALL_MARK / 1e18 / 1e12 + 5e6;
+        uint256 imA = qtyA * entry / 1e18 / 1e12 + 5e6;
+        uint256 imB = qtyB * entry / 1e18 / 1e12 + 5e6;
 
         vm.prank(ALICE);
         book.deposit(CALL, imA);
@@ -343,23 +332,18 @@ contract BookAdminTest is Test {
         vm.prank(BOB);
         book.openLong(CALL, qtyB);   // ss.netWritten = 3e18
 
-        // ── Advance mark so both positions win (5e18 → 6e18, ≤ +20% dev) ──
+        // ── Drive spot up so both positions win (100 → 110); no funding (< 1 period) ──
         vm.warp(block.timestamp + 1800);
-        vm.prank(KEEPER);
-        book.postMark(CALL, 6e18);   // +1 USDC gain per 1e18 qty
+        oracle.set(110e18);
+        book.accrue(CALL);
+        assertGt(_mark(CALL), entry, "mark rose (both positions winning)");
 
         // ── Emergency wind-down ────────────────────────────────────────────
-        // setUp seeded 500e18 cover (tick-aligned) → coverHype drops to 0.
-        // Pool receives ~50_000 USDC from the cover sale (500 HYPE × $100).
         book.pause();
         book.emergencyUnwindCover();
         assertEq(vault.coverHype(), 0, "cover fully unwound (tick-aligned)");
 
-        // ── ALICE closes — must NOT revert with the fix ────────────────────
-        // Old code: maxSell = vault.coverHype() − (ss.netWritten − p.qty)
-        //         = 0 − (3e18 − 1e18) = 0 − 2e18 → checked-underflow → REVERT
-        // New code: ch=0, rem=2e18, ch>rem is false → maxSell=0 → sellHype=0 →
-        //           no vault.sellCover call → require(poolFree() >= g) passes.
+        // ── ALICE closes — paid from poolFree (cover exhausted → maxSell clamps to 0, no revert) ──
         uint256 colA0 = book.traderCollateral(CALL_U, ALICE);
         uint256 free0 = book.poolFree();
         vm.prank(ALICE);
@@ -369,8 +353,6 @@ contract BookAdminTest is Test {
         assertEq(qaAfter, 0, "ALICE position deleted");
         assertGt(book.traderCollateral(CALL_U, ALICE), colA0, "ALICE received gain");
         assertLt(book.poolFree(), free0, "poolFree decreased by ALICE gain");
-
-        // Conservation after ALICE close
         assertEq(
             vault.poolUsdc(),
             book.poolFree() + book.putEscrow() + book.totalCollateral(),
@@ -378,8 +360,6 @@ contract BookAdminTest is Test {
         );
 
         // ── BOB closes — must NOT revert either ───────────────────────────
-        // With old code ALICE's close reverted, so ss.netWritten stayed at 3e18.
-        // BOB would also underflow: 0 − (3e18 − 2e18) = 0 − 1e18 → REVERT.
         uint256 colB0 = book.traderCollateral(CALL_U, BOB);
         vm.prank(BOB);
         book.close(CALL);
@@ -387,8 +367,6 @@ contract BookAdminTest is Test {
         (uint256 qbAfter,,) = book.positions(CALL_U, BOB);
         assertEq(qbAfter, 0, "BOB position deleted");
         assertGt(book.traderCollateral(CALL_U, BOB), colB0, "BOB received gain");
-
-        // Conservation after BOB close
         assertEq(
             vault.poolUsdc(),
             book.poolFree() + book.putEscrow() + book.totalCollateral(),
@@ -407,7 +385,7 @@ contract BookAdminTest is Test {
 
         EverlastingBook b2 = new EverlastingBook(
             v2, oracle, KEEPER,
-            KPUT, WPUT, KCALL, 10_000e18, 10_000e18
+            KPUT, WPUT, KCALL, 10_000e18, 10_000e18, mockVol
         );
         b2.pause();
 
@@ -450,62 +428,42 @@ contract BookAdminTest is Test {
 
     // ── Precision round-trip: no op creates or destroys value ────────────────
     //
-    // Mathematical property (proved in T8 design doc):
-    //
     //   Let eq = poolFree + putEscrow + coverEquityUsdc (pool's total equity, ex trader claims).
-    //   Over a round-trip: eq₀ (pre-open) → open → mark → close → eq₁ (post-close),
-    //   with the trader netting pnl USDC:
-    //
-    //     eq₁ = eq₀ − pnl    (exactly, using the T7 ceil-to-tick cover sale design)
-    //
-    //   This holds because coverEquityUsdc is the USDC mark-to-market value of the HYPE cover,
-    //   and sellCover(sellHype) converts exactly sellHype's equity from cover to poolFree.
-    //   The ceil-to-tick ensures proceeds ≥ payout; the "surplus" tick stays in poolFree.
-    //   We allow ±1 unit tolerance for _toUsdc integer truncation in coverEquityUsdc.
+    //   Over a round-trip eq₀ (pre-open) → open → oracle-move → close → eq₁, with the trader netting
+    //   pnl USDC:  eq₁ = eq₀ − pnl  (exactly, using the T7 ceil-to-tick cover sale; ±1 for _toUsdc
+    //   truncation in coverEquityUsdc). The cover px is kept fixed so coverEquity only moves via sales.
 
-    /// @dev Run one round-trip and return (equity delta, trader pnl) as signed integers.
-    function _roundTrip(
-        uint256 spotWad,
-        uint256 entryMark,
-        uint256 exitMark,
-        uint256 qty
-    ) internal returns (int256 eqDelta, int256 pnl) {
-        oracle.set(spotWad);
-        vault.setMockPx(spotWad);
-
-        // Warp past MAX_MARK_AGE so the next postMark is an unconstrained first mark
-        vm.warp(block.timestamp + 8001);
+    /// @dev Run one round-trip and return (equity delta, trader pnl). The mark is moved by the ORACLE
+    ///      (spot0 → spot1); same block so there is no funding — PnL is pure mark PnL.
+    function _roundTrip(uint256 spot0, uint256 spot1, uint256 qty)
+        internal
+        returns (int256 eqDelta, int256 pnl)
+    {
+        oracle.set(spot0);
+        book.accrue(CALL);
+        uint256 entryMark = _mark(CALL);
 
         uint256 eq0  = _equity();
         uint256 col0 = book.traderCollateral(CALL_U, BOB);
 
-        // Post entry mark (fresh — no deviation check on a stale-then-new mark)
-        vm.prank(KEEPER);
-        book.postMark(CALL, entryMark);
-
-        // BOB opens: IM = qty·entryMark / 1e18 / 1e12 (6dp), plus buffer
         uint256 im = qty * entryMark / 1e18 / 1e12 + 2e6;
         vm.prank(BOB);
         book.deposit(CALL, im);
         vm.prank(BOB);
         book.openLong(CALL, qty);
 
-        // Advance half a funding period (no funding accrual; still within MAX_MARK_AGE)
-        vm.warp(block.timestamp + 1800);
+        // Move the mark via the oracle (same block ⇒ no funding).
+        oracle.set(spot1);
+        book.accrue(CALL);
 
-        // Post exit mark (deviation check: must be within ±20% of entryMark)
-        vm.prank(KEEPER);
-        book.postMark(CALL, exitMark);
-
-        // BOB closes
         vm.prank(BOB);
         book.close(CALL);
 
         uint256 eq1  = _equity();
         uint256 col1 = book.traderCollateral(CALL_U, BOB);
 
-        eqDelta = int256(eq1)   - int256(eq0);   // pool equity change (negative for gain payout)
-        pnl     = int256(col1)  - int256(col0) - int256(im); // trader net pnl (positive = gain)
+        eqDelta = int256(eq1)  - int256(eq0);        // pool equity change (negative for gain payout)
+        pnl     = int256(col1) - int256(col0) - int256(im); // trader net pnl (positive = gain)
     }
 
     /// @dev Conservation helper: assert |eqDelta + pnl| ≤ 1 (precision tolerance).
@@ -515,34 +473,25 @@ contract BookAdminTest is Test {
         assertLe(sumAbs, 1, label);
     }
 
-    /// @notice Exact-tick scenario: g = 1 USDC at spot=$100 → hypeForG = exactly 1 tick.
-    ///         No rounding in the ceil-to-tick step; pool equity decreases by exactly g.
-    function test_precision_exact_tick_gain() public {
-        // qty=1e18, entryMark=5e18, exitMark=6e18 → markGainU = _toUsdc(1e18) = 1_000_000
-        // hypeForG = (1_000_000 * 1e12) * 1e18 / 100e18 = 1e16 = 1 tick exactly
-        (int256 ed, int256 pnl) = _roundTrip(100e18, 5e18, 6e18, 1e18);
+    /// @notice Gain scenario (spot 100→110): trader wins; pool equity falls by exactly the gain.
+    function test_precision_gain_conserved() public {
+        (int256 ed, int256 pnl) = _roundTrip(100e18, 110e18, 1e18);
         assertTrue(pnl > 0, "expected trader gain");
-        _assertConserved(ed, pnl, "exact tick: |eqDelta + pnl| <= 1");
+        _assertConserved(ed, pnl, "gain: |eqDelta + pnl| <= 1");
         assertLe(ed, int256(0), "pool equity non-increasing net of gain");
     }
 
-    /// @notice Sub-tick scenario: g = 1.5 USDC at spot=$100 → hypeForG = 1.5 ticks, ceiled to 2.
-    ///         Cover sale over-sells by 0.5 ticks; pool keeps the surplus in poolFree.
-    ///         Total pool equity still decreases by exactly g (tick surplus stays in the pool).
-    function test_precision_sub_tick_gain() public {
-        // qty=1.5e18, marks 5e18→6e18 → markGainU = _toUsdc(1.5e18) = 1_500_000 (within 20% dev)
-        // hypeForG = 1.5e16 → ceil to 2e16; pool equity conserved within 1 unit
-        (int256 ed, int256 pnl) = _roundTrip(100e18, 5e18, 6e18, 1_500_000_000_000_000_000);
+    /// @notice Larger-qty gain (spot 100→110, qty=1.5): the ceil-to-tick cover sale still conserves.
+    function test_precision_gain_larger_qty_conserved() public {
+        (int256 ed, int256 pnl) = _roundTrip(100e18, 110e18, 1_500_000_000_000_000_000);
         assertTrue(pnl > 0, "expected trader gain");
-        _assertConserved(ed, pnl, "sub-tick: |eqDelta + pnl| <= 1");
+        _assertConserved(ed, pnl, "larger-qty gain: |eqDelta + pnl| <= 1");
         assertLe(ed, int256(0), "pool equity non-increasing net of gain");
     }
 
-    /// @notice Loss scenario: trader loses; pool gains that amount; no value created.
+    /// @notice Loss scenario (spot 110→100): trader loses; pool gains that amount; no value created.
     function test_precision_loss_no_value_created() public {
-        // entryMark=6e18, exitMark=5e18 → markLossU = 1_000_000 (1 USDC loss to trader)
-        // Pool equity should increase by exactly 1_000_000
-        (int256 ed, int256 pnl) = _roundTrip(100e18, 6e18, 5e18, 1e18);
+        (int256 ed, int256 pnl) = _roundTrip(110e18, 100e18, 1e18);
         assertTrue(pnl < 0, "expected trader loss");
         _assertConserved(ed, pnl, "loss: |eqDelta + pnl| <= 1");
         assertGe(ed, int256(0), "pool equity non-decreasing net of loss");
