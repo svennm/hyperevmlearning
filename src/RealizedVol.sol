@@ -3,6 +3,7 @@ pragma solidity 0.8.35;
 
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
+import {IVolSource} from "./interfaces/IVolSource.sol";
 
 /// @title RealizedVol — manipulation-resistant annualized realized volatility (capped EWMA).
 /// @notice σ is the ATM anchor for the on-chain mark. Manipulation guards:
@@ -21,7 +22,7 @@ import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 ///         being first-caller-set is safe: a manipulated anchor only inflates subsequent |returns|
 ///         (σ up = pool-conservative), never down. Requires ≥1 honest intra-period observation during
 ///         volatility, which is permissionless and cheap.
-contract RealizedVol {
+contract RealizedVol is IVolSource {
     uint256 public constant LAMBDA           = 0.99e18;  // EWMA decay
     uint256 public constant R_MAX            = 0.10e18;  // per-sample return cap (10%)
     uint256 public constant PERIOD           = 3600;     // 1 hour
