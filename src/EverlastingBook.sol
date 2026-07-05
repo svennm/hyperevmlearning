@@ -45,6 +45,16 @@ contract EverlastingBook {
     uint8   internal constant MARK_N_TERMS  = 6;
     /// @notice σ ceiling after the skew multiplier (mirrors RealizedVol.SIGMA_MAX).
     uint256 internal constant SIGMA_CEIL    = 3e18;
+    /// @notice σ floor after the adaptive multiplier (mirrors RealizedVol.SIGMA_MIN).
+    uint256 internal constant SIGMA_FLOOR   = 0.2e18;
+
+    // ── Adaptive vol controller (Phase 2 — integral term on σ, demand-determined) ──
+
+    /// @notice adaptiveMult clamp: the integral can at most halve or triple the σ level.
+    uint256 internal constant MULT_MIN      = 0.5e18;
+    uint256 internal constant MULT_MAX      = 3e18;
+    /// @notice Hard cap on the owner-set integral gain k (per-period step at |U−uStar|=1).
+    uint256 public    constant MAX_ADAPT_K  = 0.1e18;
 
     // ── Immutables ─────────────────────────────────────────────────────────────
 
@@ -151,6 +161,25 @@ contract EverlastingBook {
     ///         Once set AND ready(), postMark bounds the keeper mark to ±MARK_BAND_BPS of fairMark().
     RealizedVol public vol;
 
+    // ── Adaptive vol controller params (Phase 2; per-side, owner-set) ──────────
+    //
+    // Integral of the demand error, folded once per funding period in postMark:
+    //   adaptiveMult[side] += k·(U − uStar)·periods,  clamped [MULT_MIN, MULT_MAX]
+    // and applied as a σ level-shift in fairMark (below the ±band). Persistent over-target
+    // demand ⇒ mult climbs ⇒ mark richens ⇒ demand cools at uStar → vol is set by flow, not the
+    // model. Manip-proof (U needs real size), slow + clamped (no cheap drag / oscillation).
+    // Different time-scale from the P(U) surcharge (fast proportional) ⇒ no double-count.
+
+    /// @notice Per-side σ multiplier (WAD). Seeded to WAD ⇒ inert; only moves once adaptiveK>0.
+    /// @dev Keyed by uint8(Side): 0 = PUT, 1 = COVERED_CALL.
+    mapping(uint8 => uint256) public adaptiveMult;
+
+    /// @notice Integral gain k (WAD). Default 0 ⇒ controller OFF until owner activates. ≤ MAX_ADAPT_K.
+    uint256 public adaptiveK;
+
+    /// @notice Target utilization U* (WAD, ∈(0,1)). Default 0.5; error = U − uStar.
+    uint256 public uStar;
+
     // ── Events ────────────────────────────────────────────────────────────────
 
     event Deposited(Side indexed side, address indexed trader, uint256 amt);
@@ -179,6 +208,10 @@ contract EverlastingBook {
     event UMaxSet(uint256 oldUMax, uint256 newUMax);
     /// @notice Emitted when the owner wires (or rewires) the realized-vol source.
     event VolSet(address indexed vol);
+    /// @notice Emitted when the owner sets the adaptive controller gain / target.
+    event AdaptiveParamsSet(uint256 k, uint256 uStar);
+    /// @notice Emitted when a period folds the integral term for a side.
+    event AdaptiveMultUpdated(Side indexed side, uint256 mult);
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -209,6 +242,11 @@ contract EverlastingBook {
         putCapNotional   = _putCapNotional;
         callCapNotional  = _callCapNotional;
         uMax             = WAD; // fail-safe: 0 would brick openLong's u-cap
+        // Adaptive controller: seed both sides' σ multiplier to WAD (inert) and U* to 0.5. The
+        // controller stays fully off until the owner sets adaptiveK>0, so 0-default is a no-op.
+        adaptiveMult[uint8(Side.PUT)]           = WAD;
+        adaptiveMult[uint8(Side.COVERED_CALL)]  = WAD;
+        uStar            = 0.5e18;
     }
 
     // ── Modifiers (T8) ───────────────────────────────────────────────────────
@@ -257,6 +295,17 @@ contract EverlastingBook {
         emit VolSet(address(newVol));
     }
 
+    /// @notice Set the adaptive controller gain k and target utilization uStar (owner only).
+    /// @dev k is hard-capped at MAX_ADAPT_K; k=0 leaves the controller inert. uStar ∈ (0, WAD).
+    ///      Does NOT reset adaptiveMult — the integral persists across param changes.
+    function setAdaptiveParams(uint256 k, uint256 uStar_) external onlyOwner {
+        require(k <= MAX_ADAPT_K, "k>max");
+        require(uStar_ > 0 && uStar_ < WAD, "uStar range");
+        adaptiveK = k;
+        uStar = uStar_;
+        emit AdaptiveParamsSet(k, uStar_);
+    }
+
     // ── On-chain fair-value mark (BS everlasting + put-skew) ──────────────────
 
     /// @notice Skew-adjusted σ for a strike: put skew richens OTM puts (S>K); calls flat in v1.
@@ -270,12 +319,42 @@ contract EverlastingBook {
         return s > SIGMA_CEIL ? SIGMA_CEIL : s;
     }
 
+    /// @notice Apply the adaptive integral to the realized σ (Phase 2), clamped [SIGMA_FLOOR, SIGMA_CEIL].
+    /// @dev A per-side level-shift on σ. Multiplier defaults to WAD (inert fast path). Feeds fairMark
+    ///      below the ±band, so the keeper mark still can't stray from the adjusted fair value.
+    function _adaptiveSigma(Side side, uint256 sig) internal view returns (uint256) {
+        uint256 mult = adaptiveMult[uint8(side)];
+        if (mult == WAD) return sig; // inert
+        uint256 s = FixedPointMathLib.mulWad(sig, mult);
+        if (s < SIGMA_FLOOR) return SIGMA_FLOOR;
+        if (s > SIGMA_CEIL) return SIGMA_CEIL;
+        return s;
+    }
+
+    /// @notice The σ actually used for a side's fair mark: realized σ shifted by the adaptive integral.
+    function effectiveSigma(Side side) external view returns (uint256) {
+        return _adaptiveSigma(side, vol.sigma());
+    }
+
+    /// @notice Fold one demand-error step into the side's adaptive integral: mult += k·(U−uStar)·periods,
+    ///         clamped [MULT_MIN, MULT_MAX]. Called from postMark under adaptiveK>0. Signed: under-target
+    ///         demand (U<uStar) cheapens, over-target richens.
+    function _updateAdaptiveMult(Side side, uint256 periods) internal {
+        int256 err = int256(utilization(side)) - int256(uStar);          // ∈ [−uStar, WAD−uStar]
+        int256 step = (int256(adaptiveK) * err / int256(WAD)) * int256(periods);
+        int256 nv = int256(adaptiveMult[uint8(side)]) + step;
+        if (nv < int256(MULT_MIN)) nv = int256(MULT_MIN);
+        if (nv > int256(MULT_MAX)) nv = int256(MULT_MAX);
+        adaptiveMult[uint8(side)] = uint256(nv);
+        emit AdaptiveMultUpdated(side, uint256(nv));
+    }
+
     /// @notice On-chain fair mark for a side (WAD): skewed-σ everlasting BS. PUT = capped put spread
     ///         (long Kput − short Kput−Wput, skewed per leg); CALL = uncapped call.
     function fairMark(Side side) public view returns (uint256) {
         uint256 S = oracle.spotWad();
         require(S > 0, "spot=0"); // AUDIT-L: clean revert (basket lnWad/divWad would revert on S=0)
-        uint256 sig = vol.sigma();
+        uint256 sig = _adaptiveSigma(side, vol.sigma());
         if (side == Side.COVERED_CALL) {
             return OptionMath.everlastingMark(
                 true, S, Kcall, _skewedSigma(true, S, Kcall, sig), TAU_BASE, MARK_N_TERMS
@@ -538,6 +617,8 @@ contract EverlastingBook {
                 uint256 f = ss.mark >= ss.lastIntrinsic ? ss.mark - ss.lastIntrinsic : 0;
                 f += _utilSurcharge(side); // P(U): endogenous concentration surcharge (0 when κ=0)
                 ss.cumFunding += f * periods;
+                // Phase 2: fold the demand-error integral (inert while adaptiveK==0).
+                if (adaptiveK > 0) _updateAdaptiveMult(side, periods);
             }
         }
 

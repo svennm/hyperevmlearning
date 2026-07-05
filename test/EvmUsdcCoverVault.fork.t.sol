@@ -63,14 +63,16 @@ contract EvmUsdcCoverVaultForkTest is Test {
     }
 
     function test_fork_sellCover_accessControl() public {
+        // C1 (trustless custody): sellCover is onlyBookOrKeeper — a stranger hits "book/keeper".
         vm.prank(makeAddr("stranger"));
-        vm.expectRevert("only keeper");
+        vm.expectRevert("book/keeper");
         vault.sellCover(1e18);
     }
 
     function test_fork_payoutUsdc_accessControl() public {
+        // C1 (trustless custody): fund exits are onlyBook — neither owner nor keeper can extract.
         vm.prank(makeAddr("stranger"));
-        vm.expectRevert("only keeper");
+        vm.expectRevert("only book");
         vault.payoutUsdc(address(this), 1e6);
     }
 

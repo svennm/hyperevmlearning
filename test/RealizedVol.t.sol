@@ -31,12 +31,6 @@ contract RealizedVolTest is Test {
         assertTrue(vol.ready());
     }
 
-    function test_tooSoon() public {
-        _seed(100e18);
-        vm.expectRevert("too soon");
-        vol.updateVol();
-    }
-
     function test_sigma_inBounds() public {
         _seed(100e18);
         skip(3600);
@@ -75,5 +69,65 @@ contract RealizedVolTest is Test {
         oracle.set(0);
         vm.expectRevert(bytes("px=0"));
         vol.updateVol();
+    }
+
+    // ── AUDIT-M: max|return| sampling (kills the first-caller down-bias) ───────────
+
+    /// @notice The fix: within a period the running MAX |return| vs the period anchor is what
+    ///         folds into the EWMA — NOT whatever tick the boundary caller happens to pick. An
+    ///         honest observer records the intra-period spike; a later "quiet" boundary caller
+    ///         cannot suppress it. Under the old first-caller model σ would clamp to the floor.
+    function test_maxReturn_capturedNotBoundaryTick() public {
+        _seed(100e18);            // anchor = 100 at t0
+        // honest observer records the intra-period spike (same period, no fold)
+        oracle.set(110e18);       // +10% (== R_MAX)
+        vol.updateVol();
+        assertEq(vol.samples(), 0, "intra-period must not fold");
+        // price calms back down before the boundary
+        oracle.set(100.5e18);
+        skip(3600);
+        vol.updateVol();          // boundary caller at a quiet +0.5% tick
+        assertEq(vol.samples(), 1, "boundary folds exactly one sample");
+        // σ reflects the recorded 10% max, NOT the 0.5% boundary tick (which would floor σ)
+        assertApproxEqAbs(vol.sigma(), 0.936e18, 0.03e18);
+        assertGt(vol.sigma(), 0.5e18); // decisively above the floor a 0.5% tick would give
+    }
+
+    /// @notice Intra-period calls are permissionless and only record — they never fold/advance σ.
+    function test_intraPeriodCall_recordsButDoesNotFold() public {
+        _seed(100e18);
+        oracle.set(103e18);
+        vol.updateVol();
+        assertEq(vol.samples(), 0);
+        oracle.set(105e18);
+        vol.updateVol();
+        assertEq(vol.samples(), 0);
+    }
+
+    /// @notice Once a high max is recorded, a subsequent quiet same-period observation can't lower it
+    ///         (monotone high-water mark). The adversary cannot walk σ down.
+    function test_recordedMaxIsMonotonicWithinPeriod() public {
+        _seed(100e18);            // anchor = 100
+        oracle.set(108e18);       // +8%
+        vol.updateVol();          // records max = 8%
+        oracle.set(100e18);       // back to flat
+        vol.updateVol();          // must NOT lower the recorded max
+        skip(3600);
+        oracle.set(100e18);
+        vol.updateVol();          // fold → reflects 8%, not 0
+        // σ ≈ sqrt((1-λ)·0.08²·8760) ≈ 0.748
+        assertApproxEqAbs(vol.sigma(), 0.748e18, 0.03e18);
+    }
+
+    /// @notice A fold happens at most once per period; a second call in the same new period only records.
+    function test_foldOncePerPeriod() public {
+        _seed(100e18);
+        skip(3600);
+        oracle.set(105e18);
+        vol.updateVol();          // fold #1
+        assertEq(vol.samples(), 1);
+        oracle.set(106e18);
+        vol.updateVol();          // same period → record only
+        assertEq(vol.samples(), 1);
     }
 }

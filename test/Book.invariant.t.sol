@@ -317,6 +317,19 @@ contract BookInvariantHandler is Test {
         try book.setUMax(u) {} catch {}
     }
 
+    // ── Adaptive controller params: exercise the Phase-2 integral under the conservation fuzz ──
+    //
+    // _updateAdaptiveMult touches ONLY adaptiveMult (a control variable) — no USDC/escrow/collateral
+    // moves — so it can't affect conservation by construction. Fuzzing it with random k/uStar across
+    // the campaign proves the signed integral math (int256 cast + clamp) never overflows or reverts
+    // for any (U, periods) the campaign reaches.
+
+    function setAdaptiveParams(uint256 kSeed, uint256 uSeed) external {
+        uint256 k = bound(kSeed, 0, book.MAX_ADAPT_K());
+        uint256 u = bound(uSeed, 1, 1e18 - 1);
+        try book.setAdaptiveParams(k, u) {} catch {}
+    }
+
     // ── Spot driver: sweep across [1, 1000*Kcall] AND crash toward 0 ──────────
 
     function moveSpot(uint256 s) external {
