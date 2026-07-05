@@ -5,20 +5,25 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookCallCloseTest
-/// @notice Tests for EverlastingBook COVERED_CALL close/settle (Task 5):
+/// @notice Tests for EverlastingBook COVERED_CALL close/settle, migrated to the autonomous mark
+///         (Task 5). A WINNING call is created by DRIVING THE ORACLE UP (fairMark(CALL) rises with
+///         spot); a LOSING call by driving it down. Marks are read back and PnL is asserted RELATIVE
+///         to the actual computed marks (no hardcoded mark literals).
 ///   - winning close sells cover (I3) and pays g from physical vault.poolUsdc()
-///   - conservation check: vault.poolUsdc() == pool-free + Σ traderCollateral after winning close
+///   - conservation check: vault.poolUsdc() == poolFree + putEscrow + Σ traderCollateral
 ///   - M3 safety: no double-credit from sellCover's return value
+///   - T7 ceil-to-tick: a sub-tick gain sells exactly ONE tick, poolFree never eroded
 ///   - losing close floors at collateral (auto-settle floor; no underflow)
-///   - settle fires on netLossUsdc > collateral (I2 markLoss case: funding alone ≤ collateral)
+///   - settle fires on netLossUsdc > collateral (I2 markLoss case a funding-only predicate misses)
 ///   - settle reverts "solvent" when net loss ≤ collateral
 ///   - netWritten decremented symmetrically on close and settle
-///   - sub-tick dust tolerated: flooredHype=0 → no sellCover; pool covers payout directly
 contract BookCallCloseTest is Test {
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     EverlastingBook book;
 
     address constant ALICE = address(0xA11CE);
@@ -26,52 +31,65 @@ contract BookCallCloseTest is Test {
     uint256 constant KPUT      = 100e18;
     uint256 constant WPUT      =  50e18;
     uint256 constant KCALL     = 120e18;
-    uint256 constant INIT_MARK = 5e18;
-    uint256 constant HYPE_PX   = 100e18;  // $100 / HYPE (WAD)
-    uint256 constant FUNDING_PERIOD = 3600;
-    uint256 constant MAX_MARK_AGE   = 7200;
+    uint256 constant HYPE_PX   = 100e18;  // $100 / HYPE (WAD) — vault cover-sale price (fixed)
+    uint256 constant TICK      = 1e16;    // 0.01 HYPE = 1e16 WAD (szDecimals=2)
 
     EverlastingBook.Side private constant CALL = EverlastingBook.Side.COVERED_CALL;
     EverlastingBook.Side private constant PUT  = EverlastingBook.Side.PUT;
 
-    // Numeric shorthand for mapping key (uint8(COVERED_CALL) == 1)
     uint8 private constant CALL_U = 1;
 
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol();
         book   = new EverlastingBook(
             vault, oracle, address(this),
             KPUT, WPUT, KCALL,
-            10_000e18, 10_000e18
+            10_000e18, 10_000e18,
+            mockVol
         );
 
         oracle.set(100e18);        // spot $100 — call OTM (Kcall=120); intrinsic=0
-        vault.setMockPx(HYPE_PX); // $100/HYPE
+        vault.setMockPx(HYPE_PX);  // $100/HYPE (cover-sale price, kept fixed)
 
         // Seed vault: 50,000 USDC pool + 100 HYPE cover (value $10,000)
         vault.pullUsdc(address(0), 50_000e6); // poolUsdc = 50_000e6
         vault.buyCover(100e18, 10_000e6);     // poolUsdc = 40_000e6, coverHype = 100e18
 
-        // Post initial mark at t=1; isFresh=false (first mark → no deviation/funding checks)
         vm.warp(1);
-        book.postMark(CALL, INIT_MARK); // mark=5e18, lastIntrinsic=0
+        book.accrue(CALL); // establish the autonomous mark at S=100
 
-        // address(this) deposits 10e6 and opens 1 HYPE position
-        // IM = _toUsdc(1e18 × 5e18 / 1e18) = 5e6 ≤ 10e6 ✓
-        book.deposit(CALL, 10e6);  // traderCollateral[CALL][this] = 10e6; poolUsdc = 40_010e6
-        book.openLong(CALL, 1e18); // netWritten = 1e18; position stored at mark=5e18
+        // address(this) deposits 10e6 and opens 1 HYPE position at the computed entry mark.
+        book.deposit(CALL, 10e6);  // traderCollateral[CALL][this] = 10e6
+        book.openLong(CALL, 1e18); // netWritten = 1e18; entryMark = computed fair value
+    }
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    function _mark(EverlastingBook.Side side) internal view returns (uint256 m) {
+        (m,,,,) = book.sideState(uint8(side));
+    }
+
+    function _entryMark(address t) internal view returns (uint256 em) {
+        (, em,) = book.positions(CALL_U, t);
+    }
+
+    /// @dev Recompute the exact cover-sale for a gain `g` (6dp) at the fixed vault px (mirrors src).
+    function _sellFor(uint256 g) internal view returns (uint256 sellHype, uint256 proceeds) {
+        uint256 px = vault.spotPxUsdc();
+        uint256 hypeForG = (g * 1e12) * 1e18 / px;
+        sellHype = ((hypeForG + TICK - 1) / TICK) * TICK; // ceil-to-tick
+        proceeds = sellHype * px / 1e18 / 1e12;           // _toUsdc(sellHype*px/1e18)
     }
 
     // ── PUT placeholder reverts ───────────────────────────────────────────────
 
-    /// @dev PUT is enabled (T6). With no PUT position, close(PUT) hits the no-position guard.
     function test_close_put_reverts_no_position() public {
         vm.expectRevert(bytes("no position"));
         book.close(PUT);
     }
 
-    /// @dev PUT is enabled (T6). With no PUT position, settle(PUT) hits the no-position guard.
     function test_settle_put_reverts_no_position() public {
         vm.expectRevert(bytes("no position"));
         book.settle(PUT, address(this));
@@ -79,102 +97,95 @@ contract BookCallCloseTest is Test {
 
     // ── Winning close: I3 cover sale + M3 conservation ───────────────────────
 
-    /// @dev Mark rises 5→6: g=1e6; hypeForG=0.01 HYPE (1 tick); cover sold; trader paid.
+    /// @dev Oracle up 100→110: fairMark(CALL) rises → trader wins g; cover sold to fund it.
     function test_winning_close_sells_cover_and_pays_trader() public {
-        // Post mark 6e18 (within 20% deviation from 5e18); no funding period elapsed
-        vm.warp(2);
-        book.postMark(CALL, 6e18);
+        uint256 entry = _entryMark(address(this));
+        oracle.set(110e18);        // same block ⇒ no funding
+        book.accrue(CALL);
+        uint256 exit = _mark(CALL);
+        assertGt(exit, entry, "mark rose with spot (winning)");
 
-        uint256 coverBefore = vault.coverHype();                         // 100e18
-        uint256 poolBefore  = vault.poolUsdc();                          // 40_010e6
-        uint256 colBefore   = book.traderCollateral(CALL_U, address(this)); // 10e6
+        uint256 g = 1e18 * (exit - entry) / 1e18 / 1e12;
+        assertGt(g, 0, "positive gain");
+        (uint256 sellHype, uint256 proceeds) = _sellFor(g);
 
-        // g = _toUsdc(1e18*(6e18-5e18)/1e18) = 1e6
-        // hypeForG = (1e6*1e12)*1e18/100e18 = 1e16 WAD = 0.01 HYPE (exactly 1 tick)
-        // flooredHype = 1e16 → vault.sellCover(1e16) → coverHype -= 1e16, poolUsdc += 1e6
+        uint256 coverBefore = vault.coverHype();
+        uint256 poolBefore  = vault.poolUsdc();
+        uint256 colBefore   = book.traderCollateral(CALL_U, address(this));
+
         book.close(CALL);
 
-        // Cover reduced by exactly 1 tick (0.01 HYPE = 1e16 WAD)
-        assertEq(vault.coverHype(), coverBefore - 1e16, "cover sold by 1 tick");
-        // Pool increased by usdcFromSell = _toUsdc(1e16*100e18/1e18) = 1e6
-        assertEq(vault.poolUsdc(),  poolBefore + 1e6,   "poolUsdc += usdcFromSell");
-        // Trader credited g
-        assertEq(book.traderCollateral(CALL_U, address(this)), colBefore + 1e6, "trader paid g");
-        // Position cleared
+        assertEq(vault.coverHype(), coverBefore - sellHype, "cover sold = ceil-to-tick(hypeForG)");
+        assertEq(vault.poolUsdc(),  poolBefore + proceeds,  "poolUsdc += cover-sale proceeds");
+        assertEq(book.traderCollateral(CALL_U, address(this)), colBefore + g, "trader paid g");
         (uint256 qty,,) = book.positions(CALL_U, address(this));
         assertEq(qty, 0, "position deleted");
-        // netWritten back to zero
         (,,,, uint256 netW) = book.sideState(CALL_U);
         assertEq(netW, 0, "netWritten=0 after close");
     }
 
-    /// @dev Conservation check + M3 no-double-credit:
-    ///      vault.poolUsdc() must equal poolBefore + usdcFromSell (NOT poolBefore + 2*g).
-    ///      Double-credit would occur if sellCover's return value were used to credit an additional
-    ///      ledger entry on top of what vault.sellCover() already added to vault.poolUsdc().
+    /// @dev Conservation + M3 no-double-credit: pool rises by the cover-sale proceeds ONLY (not by 2·g).
     function test_winning_close_conservation_no_double_credit() public {
-        vm.warp(2);
-        book.postMark(CALL, 6e18);
+        uint256 entry = _entryMark(address(this));
+        oracle.set(110e18);
+        book.accrue(CALL);
+        uint256 g = 1e18 * (_mark(CALL) - entry) / 1e18 / 1e12;
+        (, uint256 proceeds) = _sellFor(g);
 
-        uint256 poolBefore = vault.poolUsdc(); // 40_010e6
-
+        uint256 poolBefore = vault.poolUsdc();
         book.close(CALL);
+        uint256 poolAfter = vault.poolUsdc();
 
-        uint256 poolAfter    = vault.poolUsdc();
-        uint256 traderCol    = book.traderCollateral(CALL_U, address(this));
+        assertEq(poolAfter, poolBefore + proceeds, "pool += proceeds only (no double-credit)");
 
-        // usdcFromSell = _toUsdc(1e16 * 100e18 / 1e18) = 1e6 (same as g here)
-        // Correct: poolAfter = 40_011e6. Double-credit bug: poolAfter = 40_012e6.
-        assertEq(poolAfter, poolBefore + 1e6, "pool += usdcFromSell only (no double-credit)");
-
-        // Conservation identity against the contract's OWN ledgers (not a tautology): the physical
-        // pool balance must equal poolFree() + putEscrow + totalCollateral, and totalCollateral must
-        // equal the live sum of per-trader collateral. A phantom pool mutation or a Σ drift breaks this.
+        // Conservation identity against the contract's OWN ledgers (not a tautology).
         assertEq(
             poolAfter,
             book.poolFree() + book.putEscrow() + book.totalCollateral(),
             "conservation: poolUsdc == poolFree + putEscrow + totalCollateral"
         );
-        assertEq(book.totalCollateral(), traderCol, "totalCollateral == sum traderCollateral (single actor)");
+        assertEq(
+            book.totalCollateral(),
+            book.traderCollateral(CALL_U, address(this)),
+            "totalCollateral == sum traderCollateral (single actor)"
+        );
     }
 
     // ── Winning close: sub-tick gain rounds UP to one tick (T7 tick-dust fix) ──
 
-    /// @dev T7 tick-dust fix: a gain worth LESS than 0.01 HYPE at current spot now sells exactly
-    ///      ONE tick (ceil-to-tick), NOT zero (the old floor). Proceeds P ≥ g, so poolFree() is
-    ///      replenished and NEVER eroded — the pool keeps the sub-tick excess (P − g) as FREE USDC.
-    ///      The old floor-to-0 path left the gain unfunded by cover and slowly bled poolFree().
+    /// @dev T7 tick-dust fix: a gain worth LESS than 0.01 HYPE at the current px sells exactly ONE
+    ///      tick (ceil-to-tick), NOT zero. Proceeds P ≥ g, so poolFree() is replenished and NEVER
+    ///      eroded — the pool keeps the sub-tick excess (P − g) as FREE USDC.
     ///
-    ///      Setup: close the setUp position (neutral, g=0), then open 0.1 HYPE.
-    ///      Mark 5→6: g = _toUsdc(0.1e18*(6-5)/1e18) = 1e5 USDC.
-    ///      hypeForG = (1e5*1e12)*1e18/100e18 = 1e15 WAD < 0.01 HYPE (1e16 WAD) → ceils UP to 1e16.
-    ///      sellCover(1e16) → coverHype -= 1e16, poolUsdc += P = _toUsdc(1e16*100e18/1e18) = 1e6.
-    ///      Trader is credited g = 1e5; the pool keeps P − g = 9e5 as pool-free USDC.
+    ///      Neutral-close the setUp position (g=0, no cover sold), then open 0.1 HYPE and win a tiny
+    ///      amount by nudging spot up. g < 1 USDC ⇒ hypeForG < one tick ⇒ ceils UP to exactly 1e16.
     function test_winning_close_sub_tick_gain_rounds_up_one_tick() public {
-        // Neutral-close the setUp position (mark unchanged → g=0, l=0). g=0 → NO cover sold.
+        // Neutral-close the setUp position (mark unchanged → g=0 → NO cover sold).
         book.close(CALL);
         assertEq(book.traderCollateral(CALL_U, address(this)), 10e6, "neutral close: collateral unchanged");
 
-        // Deposit extra IM for 0.1 HYPE; IM = _toUsdc(0.1e18*5e18/1e18) = 5e5
-        book.deposit(CALL, 2e6);
-        book.openLong(CALL, 0.1e18); // 1e17 WAD
+        book.openLong(CALL, 0.1e18); // reuse existing collateral; entry = current mark at S=100
+        uint256 entry = _entryMark(address(this));
 
-        vm.warp(2);
-        book.postMark(CALL, 6e18);
+        oracle.set(110e18);
+        book.accrue(CALL);
+        uint256 g = 0.1e18 * (_mark(CALL) - entry) / 1e18 / 1e12;
+        assertGt(g, 0, "positive sub-tick gain");
 
-        uint256 coverBefore    = vault.coverHype();   // 100e18
-        uint256 poolBefore     = vault.poolUsdc();    // 40_012e6
+        (uint256 sellHype, uint256 proceeds) = _sellFor(g);
+        assertEq(sellHype, TICK, "sub-tick gain ceils to exactly one tick");
+        assertEq(proceeds, 1e6,  "one tick of $100 HYPE = 1 USDC proceeds");
+        assertGt(proceeds, g,    "proceeds >= payout (poolFree never eroded)");
+
+        uint256 coverBefore    = vault.coverHype();
+        uint256 poolBefore     = vault.poolUsdc();
         uint256 totalColBefore = book.totalCollateral();
 
         book.close(CALL);
 
-        // g = 1e5 USDC; hypeForG = 1e15 WAD; ceilHype = 1e16 (exactly one tick) → sellCover(1e16)
-        assertEq(vault.coverHype(), coverBefore - 1e16, "sub-tick gain sells exactly one tick");
-        // Proceeds P = 1e6 credited to the pool; trader paid only g = 1e5
-        assertEq(vault.poolUsdc(), poolBefore + 1e6, "poolUsdc += P (1e6 proceeds)");
-        assertEq(book.traderCollateral(CALL_U, address(this)), 12e6 + 1e5, "trader paid g=1e5");
-        // poolFree() GREW by P − g = 9e5 (never eroded): ΔpoolUsdc(+1e6) − ΔtotalCollateral(+1e5)
-        assertEq(book.totalCollateral(), totalColBefore + 1e5, "totalCollateral += g only");
+        assertEq(vault.coverHype(), coverBefore - TICK, "sub-tick gain sells exactly one tick");
+        assertEq(vault.poolUsdc(),  poolBefore + proceeds, "poolUsdc += proceeds");
+        assertEq(book.totalCollateral(), totalColBefore + g, "totalCollateral += g only");
         assertEq(
             vault.poolUsdc(),
             book.poolFree() + book.putEscrow() + book.totalCollateral(),
@@ -184,48 +195,46 @@ contract BookCallCloseTest is Test {
 
     // ── Losing close ──────────────────────────────────────────────────────────
 
-    /// @dev Normal loss: mark falls 5→4; l=1e6 ≤ collateral=10e6; no cover sold.
+    /// @dev Normal loss: oracle down 100→90 → mark falls; l ≤ collateral; no cover sold.
     function test_losing_close_normal() public {
-        vm.warp(MAX_MARK_AGE + 2); // stale mark → bypass deviation guard
-        book.postMark(CALL, 4e18); // intrinsic=0, so any mark ≥ 0 accepted
+        uint256 entry = _entryMark(address(this));
+        oracle.set(90e18);
+        book.accrue(CALL);
+        uint256 exit = _mark(CALL);
+        assertLt(exit, entry, "mark fell with spot (losing)");
+        uint256 l = 1e18 * (entry - exit) / 1e18 / 1e12;
+        assertLe(l, 10e6, "loss within collateral");
 
-        uint256 poolBefore = vault.poolUsdc();  // 40_010e6
-        uint256 colBefore  = book.traderCollateral(CALL_U, address(this)); // 10e6
+        uint256 poolBefore = vault.poolUsdc();
+        uint256 colBefore  = book.traderCollateral(CALL_U, address(this));
 
         book.close(CALL);
 
-        // l = _toUsdc(1e18*(5e18-4e18)/1e18) = 1e6; no cover sold
-        assertEq(book.traderCollateral(CALL_U, address(this)), colBefore - 1e6, "collateral reduced by l");
-        assertEq(vault.poolUsdc(),  poolBefore,    "pool unchanged on loss (l accrues to pool free)");
-        assertEq(vault.coverHype(), 100e18,         "cover unchanged on loss");
+        assertEq(book.traderCollateral(CALL_U, address(this)), colBefore - l, "collateral reduced by l");
+        assertEq(vault.poolUsdc(),  poolBefore, "pool unchanged on loss (l accrues to pool free)");
+        assertEq(vault.coverHype(), 100e18,      "cover unchanged on loss");
         (uint256 qty,,) = book.positions(CALL_U, address(this));
         assertEq(qty, 0, "position deleted");
         (,,,, uint256 netW) = book.sideState(CALL_U);
         assertEq(netW, 0, "netWritten=0");
     }
 
-    /// @dev Auto-settle floor: accumulated funding makes l > collateral.
-    ///      3 periods at mark=5e18 (intrinsic=0): cumFunding=15e18; fundingU=15e6 > collateral=10e6.
-    ///      l floored to 10e6; traderCollateral → 0; no underflow.
+    /// @dev Auto-settle floor: accumulated funding makes l > collateral. Spot unchanged so the mark
+    ///      stays constant and funding = mark·periods; after enough periods fundingU > collateral(10e6),
+    ///      so l floors to collateral and traderCollateral → 0 with no underflow.
     function test_losing_close_floors_at_collateral() public {
-        // Period 1: warp 3600s, re-post same mark
-        vm.warp(3601);
-        book.postMark(CALL, 5e18); // periods=1; cumFunding += 5e18
+        // Fold 100 periods of funding at the unchanged mark.
+        vm.warp(block.timestamp + 100 * book.FUNDING_PERIOD());
+        book.accrue(CALL);
 
-        // Period 2
-        vm.warp(7201);
-        book.postMark(CALL, 5e18); // cumFunding += 5e18 → 10e18
-
-        // Period 3
-        vm.warp(10801);
-        book.postMark(CALL, 5e18); // cumFunding += 5e18 → 15e18
-
-        uint256 colBefore = book.traderCollateral(CALL_U, address(this));
-        assertEq(colBefore, 10e6, "pre-close collateral");
+        assertGt(
+            book.netLossUsdc(CALL, address(this)),
+            book.traderCollateral(CALL_U, address(this)),
+            "funding drove loss over collateral"
+        );
 
         book.close(CALL);
 
-        // fundingU = _toUsdc(1e18*15e18/1e18) = 15e6; markGainU=0; l=15e6 > 10e6 → floor to 10e6
         assertEq(book.traderCollateral(CALL_U, address(this)), 0, "collateral zeroed (floor)");
         (uint256 qty,,) = book.positions(CALL_U, address(this));
         assertEq(qty, 0, "position deleted after floor close");
@@ -235,8 +244,7 @@ contract BookCallCloseTest is Test {
 
     // ── settle ────────────────────────────────────────────────────────────────
 
-    /// @dev settle reverts "solvent" when netLossUsdc ≤ collateral.
-    ///      Fresh setup: no funding, mark unchanged → netLossUsdc=0 ≤ 10e6.
+    /// @dev settle reverts "solvent" when netLossUsdc ≤ collateral (no funding, mark unchanged).
     function test_settle_reverts_solvent() public {
         vm.expectRevert(bytes("solvent"));
         book.settle(CALL, address(this));
@@ -248,60 +256,55 @@ contract BookCallCloseTest is Test {
         book.settle(CALL, address(0xDEAD));
     }
 
-    /// @dev I2 markLoss insolvency: funding alone ≤ collateral, but markLoss + funding > collateral.
-    ///      This is the case a funding-only predicate would miss (keeper lockout).
-    ///
-    ///      alice deposits 5e6 (= IM exactly) and opens 1 HYPE at mark=5e18.
-    ///      After 1 period: mark drops to 4e18 (−20%, boundary of deviation guard).
-    ///        cumFunding = 5e18 → fundingU = 5e6 (= collateral, NOT > collateral)
-    ///        markLossU  = _toUsdc(1e18*(5e18-4e18)/1e18) = 1e6
-    ///        netLossUsdc = 6e6 > collateral 5e6 → INSOLVENT
-    ///      Old funding-only check (pendingFunding/1e12 > collateral) → 5e6 > 5e6 → FALSE (misses it).
+    /// @dev I2 markLoss insolvency: funding alone == collateral, but markLoss pushes netLoss over it —
+    ///      the case a funding-only predicate would miss (keeper lockout). ALICE opens with collateral
+    ///      == IM (= qty·entryMark), so one period of funding exactly equals her collateral; then a
+    ///      downward mark move adds markLoss, making netLoss > collateral while funding alone is not.
     function test_settle_fires_mark_loss_insolvency() public {
-        // Fund and open alice's position (address(this) already has a position from setUp)
-        vm.prank(ALICE);
-        book.deposit(CALL, 5e6); // MockCoverVault.pullUsdc ignores `from`; poolUsdc += 5e6
-        vm.prank(ALICE);
-        book.openLong(CALL, 1e18); // entryMark=5e18, entryCumFunding=0
+        uint256 markC0 = _mark(CALL);           // S=100 entry mark
+        uint256 im     = 1e18 * markC0 / 1e18 / 1e12; // IM = _toUsdc(qty·mark)
 
-        // One funding period: cumFunding accumulates mark(5e18) - lastIntrinsic(0) = 5e18
-        vm.warp(3601);
-        book.postMark(CALL, 4e18); // mark drops by exactly 20%; cumFunding += 5e18*1
+        vm.prank(ALICE);
+        book.deposit(CALL, im);                 // collateral == IM exactly
+        vm.prank(ALICE);
+        book.openLong(CALL, 1e18);              // entryMark = markC0, entryCumFunding = 0
 
-        // Verify predicates
+        // One funding period at unchanged spot ⇒ cumFunding += markC0 ⇒ fundingU == im == collateral.
+        vm.warp(block.timestamp + book.FUNDING_PERIOD());
+        book.accrue(CALL);
+        // Same-block downward move adds markLoss without extra funding.
+        oracle.set(95e18);
+        book.accrue(CALL);
+
         uint256 aliceCol     = book.traderCollateral(CALL_U, ALICE);
         uint256 netLoss      = book.netLossUsdc(CALL, ALICE);
         uint256 fundingAlone = book.pendingFunding(CALL, ALICE) / 1e12;
 
-        assertEq(aliceCol,     5e6, "alice collateral");
-        assertEq(fundingAlone, 5e6, "funding alone = collateral (old predicate: no-fire)");
+        assertEq(fundingAlone, aliceCol, "funding alone == collateral (old predicate: no-fire)");
         assertLe(fundingAlone, aliceCol, "funding alone does NOT exceed collateral");
-        assertEq(netLoss, 6e6,          "full netLossUsdc = 6e6 (markLoss pushes it over)");
-        assertGt(netLoss, aliceCol,     "truly insolvent -> settle fires");
+        assertGt(netLoss, aliceCol,      "markLoss pushes netLoss over collateral -> insolvent");
 
-        // settle is permissionless; anyone can call
         book.settle(CALL, ALICE);
 
         (uint256 qty,,) = book.positions(CALL_U, ALICE);
         assertEq(qty, 0, "alice position deleted after force-close");
-        assertEq(book.traderCollateral(CALL_U, ALICE), 0, "alice collateral zeroed (loss=6e6>5e6, floor)");
+        assertEq(book.traderCollateral(CALL_U, ALICE), 0, "alice collateral zeroed (floor)");
     }
 
     /// @dev settle fires on funding-driven insolvency (2 periods; funding > collateral).
-    ///      netWritten decrements for both address(this) and alice independently.
+    ///      netWritten decrements for alice while address(this) stays open.
     function test_settle_fires_funding_insolvency() public {
-        // alice opens 1 HYPE (IM=5e6; deposit exactly IM)
-        vm.prank(ALICE);
-        book.deposit(CALL, 5e6);
-        vm.prank(ALICE);
-        book.openLong(CALL, 1e18); // netWritten = 2e18 (this + alice)
+        uint256 markC0 = _mark(CALL);
+        uint256 im     = 1e18 * markC0 / 1e18 / 1e12;
 
-        // 2 periods: cumFunding = 5e18 + 5e18 = 10e18 → fundingU = 10e6 > alice's 5e6
-        vm.warp(3601);
-        book.postMark(CALL, 5e18); // period 1: cumFunding = 5e18
+        vm.prank(ALICE);
+        book.deposit(CALL, im);
+        vm.prank(ALICE);
+        book.openLong(CALL, 1e18);              // netWritten = 2e18 (this + alice)
 
-        vm.warp(7201);
-        book.postMark(CALL, 5e18); // period 2: cumFunding = 10e18
+        // 2 periods at unchanged mark ⇒ fundingU = 2·im > collateral(im).
+        vm.warp(block.timestamp + 2 * book.FUNDING_PERIOD());
+        book.accrue(CALL);
 
         assertGt(book.netLossUsdc(CALL, ALICE), book.traderCollateral(CALL_U, ALICE), "insolvent");
 
@@ -309,26 +312,23 @@ contract BookCallCloseTest is Test {
 
         (uint256 qty,,) = book.positions(CALL_U, ALICE);
         assertEq(qty, 0, "alice position cleared");
-
         (,,,, uint256 netW) = book.sideState(CALL_U);
         assertEq(netW, 1e18, "netWritten = 1e18 (address(this) still open)");
     }
 
     // ── netWritten symmetry ───────────────────────────────────────────────────
 
-    /// @dev Winning close and losing close both decrement netWritten to 0.
-    ///      (Each sub-test is self-contained via fork or sequential state.)
     function test_netWritten_zero_after_winning_close() public {
-        vm.warp(2);
-        book.postMark(CALL, 6e18);
+        oracle.set(110e18);
+        book.accrue(CALL);
         book.close(CALL);
         (,,,, uint256 netW) = book.sideState(CALL_U);
         assertEq(netW, 0);
     }
 
     function test_netWritten_zero_after_losing_close() public {
-        vm.warp(MAX_MARK_AGE + 2);
-        book.postMark(CALL, 4e18);
+        oracle.set(90e18);
+        book.accrue(CALL);
         book.close(CALL);
         (,,,, uint256 netW) = book.sideState(CALL_U);
         assertEq(netW, 0);
