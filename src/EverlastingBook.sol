@@ -371,6 +371,42 @@ contract EverlastingBook {
         return fairHi > fairLo ? fairHi - fairLo : 0;
     }
 
+    // ── Computed mark + permissionless accrue ────────────────────────────────
+
+    /// @notice The on-chain mark for a side: fair value floored at intrinsic (funding→0 there, AUDIT-H),
+    ///         PUT additionally capped at Wput (payout cap). No keeper input.
+    function _computedMark(Side side) internal view returns (uint256 m) {
+        m = fairMark(side);
+        uint256 intr = intrinsic(side);
+        if (m < intr) m = intr;
+        if (side == Side.PUT && m > Wput) m = Wput;
+    }
+
+    /// @notice Permissionless: fold funding since the last accrue (using the stored period-start mark),
+    ///         then refresh the stored mark to the on-chain computed fair value. Anyone may call — no
+    ///         discretion (the mark is a formula). Reverts only if the oracle can't price (spot==0); that
+    ///         blocks openLong (correct — don't open into a dead oracle) but never blocks close/settle,
+    ///         which read the stored mark and never call this.
+    function accrue(Side side) public {
+        SideState storage ss = sideState[uint8(side)];
+        uint256 intr = intrinsic(side);
+        if (ss.mark != 0) {
+            uint256 age = block.timestamp - ss.lastMarkTime;
+            uint256 periods = age / FUNDING_PERIOD;
+            if (periods > 0) {
+                uint256 f = ss.mark >= ss.lastIntrinsic ? ss.mark - ss.lastIntrinsic : 0;
+                f += _utilSurcharge(side);                 // P(U), now always-on (UTIL_KAPPA const)
+                ss.cumFunding += f * periods;
+                _updateAdaptiveMult(side, periods);        // controller (ADAPT_K const)
+            }
+        }
+        ss.mark = _computedMark(side);                     // ← the mark is the market, not a keeper number
+        ss.lastIntrinsic = intr;
+        ss.lastMarkTime = block.timestamp;
+        emit MarkPosted(side, ss.mark, ss.cumFunding);
+        if (address(vol) != address(0)) { try vol.updateVol() {} catch {} }
+    }
+
     /// @notice Initiate a 2-step ownership transfer. Does NOT change owner until acceptOwnership().
     /// @dev OZ Ownable2Step semantics: no single-tx owner loss.
     function transferOwnership(address newOwner) external onlyOwner {
