@@ -274,6 +274,7 @@ contract EverlastingBook {
     ///         (long Kput − short Kput−Wput, skewed per leg); CALL = uncapped call.
     function fairMark(Side side) public view returns (uint256) {
         uint256 S = oracle.spotWad();
+        require(S > 0, "spot=0"); // AUDIT-L: clean revert (basket lnWad/divWad would revert on S=0)
         uint256 sig = vol.sigma();
         if (side == Side.COVERED_CALL) {
             return OptionMath.everlastingMark(
@@ -512,11 +513,15 @@ contract EverlastingBook {
         bool bandActive = address(vol) != address(0) && vol.ready();
         if (bandActive) {
             uint256 fair = fairMark(side);
-            require(
-                newMark >= fair * (10_000 - MARK_BAND_BPS) / 10_000
-                    && newMark <= fair * (10_000 + MARK_BAND_BPS) / 10_000,
-                "mark band"
-            );
+            uint256 loB = fair * (10_000 - MARK_BAND_BPS) / 10_000;
+            uint256 hiB = fair * (10_000 + MARK_BAND_BPS) / 10_000;
+            // AUDIT-H (crash brick): a capped put SPREAD's fair value can dip BELOW its own intrinsic
+            // near the short strike (the short leg's extrinsic), so the band and the newMark≥intrinsic
+            // floor could have an EMPTY intersection — bricking PUT postMark exactly during a crash.
+            // Floor both bounds at intrinsic so a valid mark (≥ intr) always exists; funding→0 there.
+            if (loB < intr) loB = intr;
+            if (hiB < intr) hiB = intr;
+            require(newMark >= loB && newMark <= hiB, "mark band");
         }
 
         if (isFresh) {

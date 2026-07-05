@@ -86,6 +86,29 @@ contract BookMarkBandTest is Test {
         book.postMark(CALL, fair * 11000 / 10000 * 12000 / 10000);
     }
 
+    /// @notice AUDIT-H regression: a capped put SPREAD's fair value dips below its intrinsic in a
+    ///         crash (spot ITM through the strikes). Without the intrinsic-floor on the band, the
+    ///         newMark≥intrinsic and newMark≤fair·1.1 constraints have no overlap ⇒ PUT postMark
+    ///         bricked. The fix floors the band at intrinsic so a valid mark always exists.
+    function test_crashBrick_fixed() public {
+        // Raise σ with a (capped) 10% move so the spread fair falls below intrinsic in the ITM region.
+        skip(3600);
+        oracle.set(110e18);
+        vol.updateVol();
+        assertGt(vol.sigma(), 0.5e18);
+
+        oracle.set(80e18); // spot crashes ITM through Kput=100
+        uint256 intr = book.intrinsic(PUT);
+        assertEq(intr, 20e18); // clamp(100-80, 0, Wput=20)
+        uint256 fair = book.fairMark(PUT);
+        assertLt(fair * 11000 / 10000, intr); // the empty-intersection condition the audit found
+
+        // With the fix, the keeper can still post (at intrinsic) — no brick.
+        _post(PUT, intr);
+        (uint256 m,,,,) = book.sideState(uint8(PUT));
+        assertEq(m, intr);
+    }
+
     /// @notice Bootstrap: with no vol wired, postMark falls back to the relative deviation cap.
     function test_bootstrap_deviationCapWhenNoVol() public {
         EverlastingBook b2 = new EverlastingBook(
