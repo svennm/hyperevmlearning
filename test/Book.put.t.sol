@@ -5,17 +5,21 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookPutTest
-/// @notice Task 6 — PUT side folded into EverlastingBook on the SHARED pool (slice-2 escrow model).
+/// @notice Task 6 — PUT side folded into EverlastingBook on the SHARED pool (slice-2 escrow model),
+///         migrated to the autonomous mark (Task 5): the mark is the on-chain computed fair value
+///         (BS everlasting put spread, floored at intrinsic, capped at Wput). No keeper postMark.
 ///   Covers:
 ///     - open escrows exactly qty·Wput (putEscrow rises, poolFree drops)
 ///     - "put: IM" and "put: pool escrow" revert paths
 ///     - "cap" revert on aggregate open put qty
-///     - postMark(PUT) rejects newMark > Wput (the ≤W clamp; the put-side difference vs call)
-///     - winning close pays the capped payout with escrow RELEASED FIRST (F2: no false revert
-///       even when poolFree is exactly 0 immediately before the close)
-///     - losing close floors at collateral (auto-settle) and releases escrow
+///     - computed PUT mark is clamped ≤ Wput (the put-side difference vs the uncapped call)
+///     - winning close pays the (escrow-bounded) payout with escrow RELEASED FIRST (F2: no false
+///       revert even when poolFree is exactly 0 immediately before the close). A winning PUT is
+///       created by DRIVING THE ORACLE DOWN (fairMark(PUT) rises as S falls).
+///     - losing close (oracle UP → mark falls) floors at collateral (auto-settle) and releases escrow
 ///     - settle fires on funding-driven insolvency (netLossUsdc via the shared predicate)
 ///     - PUT + CALL coexist on ONE pool with the conservation invariant holding throughout,
 ///       and neither side ever spends the other's escrow/cover/collateral
@@ -24,6 +28,7 @@ import {MockOracle} from "../src/MockOracle.sol";
 contract BookPutTest is Test {
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     EverlastingBook book;
 
     address constant ALICE = address(0xA11CE);
@@ -32,9 +37,6 @@ contract BookPutTest is Test {
     uint256 constant WPUT      =  50e18;  // put max payout / unit → escrow per unit
     uint256 constant KCALL     = 120e18;
     uint256 constant HYPE_PX   = 100e18;  // $100 / HYPE (WAD)
-    uint256 constant PUT_MARK   = 20e18;  // seed put mark (a premium in [0, Wput])
-    uint256 constant FUNDING_PERIOD = 3600;
-    uint256 constant MAX_MARK_AGE   = 7200;
 
     EverlastingBook.Side private constant PUT  = EverlastingBook.Side.PUT;
     EverlastingBook.Side private constant CALL = EverlastingBook.Side.COVERED_CALL;
@@ -44,11 +46,13 @@ contract BookPutTest is Test {
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol(); // sigma=0.8e18, ready=true
         book   = new EverlastingBook(
             vault, oracle, address(this), // keeper = test contract
             KPUT, WPUT, KCALL,
             10_000e18, // putCapNotional
-            10_000e18  // callCapNotional
+            10_000e18, // callCapNotional
+            mockVol    // vol source (autonomous mark)
         );
 
         oracle.set(100e18);       // spot $100 == Kput → put intrinsic 0; call OTM
@@ -57,6 +61,11 @@ contract BookPutTest is Test {
     }
 
     // ── helpers ────────────────────────────────────────────────────────────────
+
+    /// @dev Read the stored mark for a side.
+    function _mark(EverlastingBook.Side side) internal view returns (uint256 m) {
+        (m,,,,) = book.sideState(uint8(side));
+    }
 
     /// @dev Seed the pool's OWN free USDC (physical USDC with NO trader claim → poolFree rises).
     function _seedPoolFree(uint256 amt) internal {
@@ -84,24 +93,26 @@ contract BookPutTest is Test {
 
     // ── open: escrow = qty·W ─────────────────────────────────────────────────────
 
-    /// @dev Opening a put locks exactly qty·Wput of the pool's free USDC as escrow.
+    /// @dev Opening a put locks exactly qty·Wput of the pool's free USDC as escrow. The entry mark
+    ///      is the on-chain computed fair value (read back, not hardcoded).
     function test_put_open_escrows_qtyW() public {
         _seedPoolFree(100e6);
         book.deposit(PUT, 60e6);
-        book.postMark(PUT, PUT_MARK);
+        book.accrue(PUT);
+        uint256 m0 = _mark(PUT); // computed fair value at S=100
 
         uint256 poolFreeBefore = book.poolFree(); // 160e6 pool − 60e6 collateral = 100e6
         assertEq(poolFreeBefore, 100e6, "poolFree before open");
         assertEq(book.putEscrow(), 0, "no escrow yet");
 
-        book.openLong(PUT, 1e18); // IM = _toUsdc(1e18·50e18/1e18) = 50e6
+        book.openLong(PUT, 1e18); // escrow IM = _toUsdc(1e18·50e18/1e18) = 50e6
 
         assertEq(book.putEscrow(), 50e6, "putEscrow == qty*W");
         assertEq(book.poolFree(), poolFreeBefore - 50e6, "poolFree dropped by qty*W");
 
         (uint256 qty, uint256 entryMark,) = book.positions(PUT_U, address(this));
         assertEq(qty, 1e18, "position qty");
-        assertEq(entryMark, PUT_MARK, "entryMark");
+        assertEq(entryMark, m0, "entryMark == computed fair value");
         (,,,, uint256 netW) = book.sideState(PUT_U);
         assertEq(netW, 1e18, "put netWritten");
         _assertConservation("open");
@@ -109,11 +120,10 @@ contract BookPutTest is Test {
 
     // ── open reverts ────────────────────────────────────────────────────────────
 
-    /// @dev Trader collateral below escrow IM → "put: IM".
+    /// @dev Trader collateral below escrow IM (= qty·Wput) → "put: IM".
     function test_put_open_revert_IM() public {
         _seedPoolFree(100e6);
         book.deposit(PUT, 10e6);      // < IM = 50e6
-        book.postMark(PUT, PUT_MARK);
 
         vm.expectRevert(bytes("put: IM"));
         book.openLong(PUT, 1e18);
@@ -124,7 +134,6 @@ contract BookPutTest is Test {
     ///      the escrow must come from the pool's own capital, not the trader's margin.
     function test_put_open_revert_pool_escrow() public {
         book.deposit(PUT, 50e6);      // collateral = IM, but poolFree stays 0 (no separate seed)
-        book.postMark(PUT, PUT_MARK);
         assertEq(book.poolFree(), 0, "no pool-free USDC");
 
         vm.expectRevert(bytes("put: pool escrow"));
@@ -134,52 +143,61 @@ contract BookPutTest is Test {
     /// @dev Aggregate open put qty over the cap → "cap" (checked after IM + pool escrow pass).
     function test_put_open_revert_cap() public {
         EverlastingBook capBook = new EverlastingBook(
-            vault, oracle, address(this), KPUT, WPUT, KCALL, 2e18, 10_000e18 // putCap = 2e18
+            vault, oracle, address(this), KPUT, WPUT, KCALL, 2e18, 10_000e18, mockVol // putCap = 2e18
         );
         // Fund pool-free + trader collateral for a 3e18 open (IM = _toUsdc(3e18·50e18/1e18) = 150e6)
         vault.pullUsdc(address(this), 200e6);              // poolUsdc = 200e6
         capBook.deposit(PUT, 200e6);                        // poolFree stays 200e6
-        capBook.postMark(PUT, PUT_MARK);
 
         vm.expectRevert(bytes("cap"));
         capBook.openLong(PUT, 3e18); // netWritten 3e18 > putCap 2e18
     }
 
-    // ── postMark(PUT): ≤W clamp ──────────────────────────────────────────────────
+    // ── computed PUT mark: ≤ W clamp ──────────────────────────────────────────────
 
-    /// @dev The put-side difference from the call side: postMark rejects newMark > Wput.
-    function test_postMark_put_reverts_above_W() public {
-        vm.expectRevert(bytes("mark>W"));
-        book.postMark(PUT, WPUT + 1e18); // 51e18 > 50e18; intrinsic 0 so the clamp is what bites
+    /// @dev The put-side difference from the uncapped call: the computed mark is clamped at Wput.
+    ///      At S=$40 the intrinsic alone is clamp(100−40,0,50)=50=Wput, and fairMark ≥ that, so the
+    ///      computed mark saturates exactly at the payout cap. (Old model: postMark rejected >W.)
+    function test_put_mark_clamped_at_W() public {
+        oracle.set(40e18);
+        book.accrue(PUT);
+        assertEq(_mark(PUT), WPUT, "computed put mark capped at Wput");
     }
 
-    /// @dev newMark == Wput is accepted (boundary).
-    function test_postMark_put_accepts_at_W() public {
-        book.postMark(PUT, WPUT);
-        (uint256 m,,,,) = book.sideState(PUT_U);
-        assertEq(m, WPUT, "mark at cap accepted");
+    /// @dev Boundary: at S=$50 the intrinsic is exactly Wput, so the mark equals Wput (accepted).
+    function test_put_mark_reaches_W_boundary() public {
+        oracle.set(50e18);
+        book.accrue(PUT);
+        assertEq(_mark(PUT), WPUT, "computed put mark at cap boundary");
     }
 
     // ── winning close: escrow released FIRST (F2 no-false-revert) ────────────────
 
     /// @dev Set poolFree to EXACTLY 0 before close (all pool-free USDC is locked as escrow).
+    ///      A winning PUT is created by DRIVING THE ORACLE DOWN — fairMark(PUT) rises as S falls.
     ///      The winning payout is only fundable because the escrow is released FIRST; a
-    ///      release-after-pay ordering would revert here. Payout is bounded by escrow (capped).
+    ///      release-after-pay ordering would revert here. Payout is bounded by escrow (capped ≤ W).
     function test_put_winning_close_escrow_released_first() public {
         _seedPoolFree(50e6);          // pool's own free USDC == the escrow it must lock
         book.deposit(PUT, 50e6);      // trader IM
-        book.postMark(PUT, PUT_MARK); // 20e18
+        book.accrue(PUT);
+        uint256 entryMark = _mark(PUT); // entry mark at S=100
 
-        book.openLong(PUT, 1e18);     // escrow 50e6 locked
+        book.openLong(PUT, 1e18);     // escrow 50e6 locked; entryMark stored
         assertEq(book.poolFree(), 0, "poolFree fully locked as escrow before close");
 
-        book.postMark(PUT, 24e18);    // +20% (deviation boundary); same block → no funding
+        // WIN: spot falls → put mark rises (same block ⇒ no funding).
+        oracle.set(90e18);
+        book.accrue(PUT);
+        uint256 exitMark = _mark(PUT);
+        assertGt(exitMark, entryMark, "put mark rose as spot fell (winning)");
+        uint256 g = 1e18 * (exitMark - entryMark) / 1e18 / 1e12; // markGain in 6dp
 
         uint256 colBefore = book.traderCollateral(PUT_U, address(this)); // 50e6
-        book.close(PUT);              // g = _toUsdc(1e18·(24-20)e18/1e18) = 4e6 ≤ escrow 50e6
+        book.close(PUT);              // g ≤ escrow (mark ≤ Wput) → escrow release covers it
 
         assertEq(book.putEscrow(), 0, "escrow released");
-        assertEq(book.traderCollateral(PUT_U, address(this)), colBefore + 4e6, "trader paid g");
+        assertEq(book.traderCollateral(PUT_U, address(this)), colBefore + g, "trader paid g");
         (uint256 qty,,) = book.positions(PUT_U, address(this));
         assertEq(qty, 0, "position deleted");
         (,,,, uint256 netW) = book.sideState(PUT_U);
@@ -189,18 +207,26 @@ contract BookPutTest is Test {
 
     // ── losing close: floor at collateral, escrow released ───────────────────────
 
+    /// @dev LOSE: spot rises → put mark falls (same block ⇒ no funding). Loss is debited from
+    ///      collateral and the escrow is released.
     function test_put_losing_close_floors_and_releases_escrow() public {
         _seedPoolFree(50e6);
         book.deposit(PUT, 50e6);
-        book.postMark(PUT, PUT_MARK);
+        book.accrue(PUT);
+        uint256 entryMark = _mark(PUT);
         book.openLong(PUT, 1e18);
 
-        book.postMark(PUT, 16e18);    // −20% (deviation boundary); same block → no funding
+        oracle.set(110e18);           // put OTM-er → mark falls
+        book.accrue(PUT);
+        uint256 exitMark = _mark(PUT);
+        assertLt(exitMark, entryMark, "put mark fell as spot rose (losing)");
+        uint256 l = 1e18 * (entryMark - exitMark) / 1e18 / 1e12;
+        assertLe(l, 50e6, "loss within collateral (no floor here)");
 
-        book.close(PUT);              // l = _toUsdc(1e18·(20-16)e18/1e18) = 4e6 ≤ collateral 50e6
+        book.close(PUT);
 
         assertEq(book.putEscrow(), 0, "escrow released on loss");
-        assertEq(book.traderCollateral(PUT_U, address(this)), 46e6, "collateral reduced by l");
+        assertEq(book.traderCollateral(PUT_U, address(this)), 50e6 - l, "collateral reduced by l");
         (uint256 qty,,) = book.positions(PUT_U, address(this));
         assertEq(qty, 0, "position deleted");
         _assertConservation("losing close");
@@ -208,22 +234,25 @@ contract BookPutTest is Test {
 
     // ── settle: funding-driven insolvency ────────────────────────────────────────
 
-    /// @dev qty=0.1 put, collateral = IM = 5e6. After 3 funding periods, netLossUsdc = 6e6 > 5e6.
-    ///      settle force-closes; loss floors at collateral → 0; escrow released; conservation holds.
+    /// @dev qty=0.1 put, collateral = IM = 5e6. Funding accrues at unchanged spot (mark constant,
+    ///      lastIntrinsic 0 ⇒ f = mark each period). After enough periods netLossUsdc > collateral,
+    ///      so settle force-closes; loss floors at collateral → 0; escrow released; conservation holds.
     function test_put_settle_fires_on_insolvency() public {
         _seedPoolFree(5e6);
         book.deposit(PUT, 5e6);
-        book.postMark(PUT, PUT_MARK); // lastIntrinsic = 0
+        book.accrue(PUT);             // lastIntrinsic = 0 at S=100
         book.openLong(PUT, 0.1e18);   // IM = escrow = 5e6
 
-        // 3 funding periods at unchanged mark: f = mark(20e18) − lastIntrinsic(0) = 20e18 each
-        vm.warp(3601);  book.postMark(PUT, PUT_MARK); // cumFunding += 20e18
-        vm.warp(7201);  book.postMark(PUT, PUT_MARK); // += 20e18 → 40e18
-        vm.warp(10801); book.postMark(PUT, PUT_MARK); // += 20e18 → 60e18
+        // Fold many periods of funding at the unchanged mark (f = mark − 0 per period).
+        vm.warp(block.timestamp + 100 * book.FUNDING_PERIOD());
+        book.accrue(PUT);
 
-        // netLossUsdc = _toUsdc(0.1e18·60e18/1e18) = 6e6 > collateral 5e6
-        assertEq(book.netLossUsdc(PUT, address(this)), 6e6, "netLoss");
-        assertGt(book.netLossUsdc(PUT, address(this)), book.traderCollateral(PUT_U, address(this)), "insolvent");
+        // netLossUsdc is pure funding here (mark unchanged vs entry ⇒ markGain=markLoss=0).
+        assertGt(
+            book.netLossUsdc(PUT, address(this)),
+            book.traderCollateral(PUT_U, address(this)),
+            "funding-driven insolvency"
+        );
 
         book.settle(PUT, address(this));
 
@@ -238,7 +267,7 @@ contract BookPutTest is Test {
     function test_put_settle_reverts_solvent() public {
         _seedPoolFree(50e6);
         book.deposit(PUT, 50e6);
-        book.postMark(PUT, PUT_MARK);
+        book.accrue(PUT);
         book.openLong(PUT, 1e18);
 
         vm.expectRevert(bytes("solvent"));
@@ -249,19 +278,22 @@ contract BookPutTest is Test {
 
     /// @dev The crux of the shared-pool model: a put and a call live on the same vault.poolUsdc().
     ///      Conservation holds at every step, and closing one side never touches the other's
-    ///      escrow (put) or cover (call). Both sides win; both are paid from their OWN sources
-    ///      (put ← released escrow; call ← cover sale) with no cross-contamination.
+    ///      escrow (put) or cover (call). Under the autonomous mark both marks derive from the SAME
+    ///      oracle, so the two sides win at DIFFERENT spots: we win+close the CALL at a high spot,
+    ///      then win+close the PUT at a low spot. Each is paid from its OWN source (put ← released
+    ///      escrow; call ← cover sale) with no cross-contamination.
     function test_put_and_call_coexist_conservation() public {
         // Seed the pool, then convert part of the pool-free USDC into call cover.
         vault.pullUsdc(address(this), 200e6); // poolUsdc = 200e6, poolFree = 200e6
         vault.buyCover(1e18, 100e6);          // poolUsdc = 100e6, coverHype = 1e18, poolFree = 100e6
 
-        book.postMark(CALL, 5e18);            // call OTM → intrinsic 0
-        book.postMark(PUT, PUT_MARK);         // 20e18
+        book.accrue(CALL);            // call OTM at S=100 → intrinsic 0
+        book.accrue(PUT);             // put ATM at S=100 → intrinsic 0
+        uint256 callEntry = _mark(CALL);
         _assertConservation("seed");
 
-        // Open the CALL: IM = 5e6; cover gate 1e18 ≥ 1e18 ✓. Call open touches no cash/escrow.
-        book.deposit(CALL, 10e6);
+        // Open the CALL: cover gate 1e18 ≥ 1e18 ✓. Call open touches no cash/escrow.
+        book.deposit(CALL, 20e6);
         uint256 putEscrowPre = book.putEscrow();
         book.openLong(CALL, 1e18);
         assertEq(book.putEscrow(), putEscrowPre, "call open did NOT touch put escrow");
@@ -269,34 +301,41 @@ contract BookPutTest is Test {
 
         // Open the PUT: escrow 50e6 locked. Put open touches no cover.
         book.deposit(PUT, 50e6);
+        uint256 putEntry = _mark(PUT);
         uint256 coverPre = vault.coverHype();
         book.openLong(PUT, 1e18);
         assertEq(vault.coverHype(), coverPre, "put open did NOT touch cover");
         assertEq(book.putEscrow(), 50e6, "put escrow locked");
         _assertConservation("put open");
 
-        // Both sides go into the money.
-        book.postMark(CALL, 6e18); // call gain 1e6 (same block → no funding)
-        book.postMark(PUT, 24e18); // put gain 4e6
+        // ── CALL wins at a HIGH spot; close it (paid from a COVER SALE) ──────────
+        oracle.set(130e18);
+        book.accrue(CALL);
+        uint256 callExit = _mark(CALL);
+        assertGt(callExit, callEntry, "call mark rose with spot (winning)");
+        uint256 gCall = 1e18 * (callExit - callEntry) / 1e18 / 1e12;
 
-        // Close the CALL: paid from a COVER SALE; must NOT disturb put escrow.
+        uint256 callColBefore = book.traderCollateral(CALL_U, address(this));
         uint256 putEscrowBeforeCallClose = book.putEscrow();
         book.close(CALL);
         assertEq(book.putEscrow(), putEscrowBeforeCallClose, "call close did NOT touch put escrow");
-        assertEq(book.traderCollateral(CALL_U, address(this)), 11e6, "call trader paid g=1e6");
+        assertEq(book.traderCollateral(CALL_U, address(this)), callColBefore + gCall, "call trader paid g");
         assertLt(vault.coverHype(), coverPre, "call close sold cover");
         _assertConservation("call close");
 
-        // Close the PUT: paid from RELEASED ESCROW; must NOT disturb cover.
+        // ── PUT wins at a LOW spot; close it (paid from RELEASED ESCROW) ─────────
+        oracle.set(90e18);
+        book.accrue(PUT);
+        uint256 putExit = _mark(PUT);
+        assertGt(putExit, putEntry, "put mark rose as spot fell (winning)");
+        uint256 gPut = 1e18 * (putExit - putEntry) / 1e18 / 1e12;
+
+        uint256 putColBefore = book.traderCollateral(PUT_U, address(this));
         uint256 coverBeforePutClose = vault.coverHype();
         book.close(PUT);
         assertEq(vault.coverHype(), coverBeforePutClose, "put close did NOT touch cover");
         assertEq(book.putEscrow(), 0, "put escrow fully released");
-        assertEq(book.traderCollateral(PUT_U, address(this)), 54e6, "put trader paid g=4e6");
+        assertEq(book.traderCollateral(PUT_U, address(this)), putColBefore + gPut, "put trader paid g");
         _assertConservation("put close");
-
-        // Final cross-contamination guard: each side's collateral moved ONLY via its own ops.
-        assertEq(book.traderCollateral(CALL_U, address(this)), 11e6, "call collateral final");
-        assertEq(book.traderCollateral(PUT_U,  address(this)), 54e6, "put collateral final");
     }
 }

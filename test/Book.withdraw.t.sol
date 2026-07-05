@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookWithdrawTest
 /// @notice Task 7 — withdraw + LP pool-free liquidity, unit-level.
@@ -16,6 +17,7 @@ import {MockOracle} from "../src/MockOracle.sol";
 contract BookWithdrawTest is Test {
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     EverlastingBook book;
 
     address constant ALICE = address(0xA11CE);
@@ -39,10 +41,12 @@ contract BookWithdrawTest is Test {
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol();
         book   = new EverlastingBook(
             vault, oracle, address(this),
             KPUT, WPUT, KCALL,
-            10_000e18, 10_000e18
+            10_000e18, 10_000e18,
+            mockVol
         );
         oracle.set(100e18);
         vault.setMockPx(HYPE_PX);
@@ -94,7 +98,7 @@ contract BookWithdrawTest is Test {
     function test_withdraw_reverts_open_position() public {
         // Seed pool-free so the put open can escrow, then open a put for ALICE.
         vault.pullUsdc(address(this), 100e6);      // poolFree = 100e6
-        book.postMark(PUT, PUT_MARK);
+        // Mark is set autonomously by openLong's auto-accrue (no keeper postMark).
         vm.prank(ALICE);
         book.deposit(PUT, 60e6);                   // IM = 50e6
         vm.prank(ALICE);
@@ -109,9 +113,8 @@ contract BookWithdrawTest is Test {
     ///      per-side guard is independent: an open CALL blocks CALL withdraw only.
     function test_withdraw_side_independent() public {
         vault.pullUsdc(address(this), 100e6);
-        // Open a CALL for ALICE (needs cover).
+        // Open a CALL for ALICE (needs cover). Mark set autonomously on open.
         vault.buyCover(1e18, type(uint256).max);
-        book.postMark(CALL, 5e18);
         vm.prank(ALICE);
         book.deposit(CALL, 10e6);
         vm.prank(ALICE);
@@ -187,7 +190,7 @@ contract BookWithdrawTest is Test {
     function test_lpWithdraw_cannot_take_escrow() public {
         // Seed pool-free, open a put that locks escrow, then poolFree drops by the escrow.
         book.lpDeposit(50e6);                      // poolFree = 50e6 (LP capital)
-        book.postMark(PUT, PUT_MARK);
+        // Mark set autonomously on open.
         vm.prank(ALICE);
         book.deposit(PUT, 50e6);                   // IM 50e6
         vm.prank(ALICE);
