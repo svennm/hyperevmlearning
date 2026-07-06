@@ -24,10 +24,10 @@ contract EverlastingBook {
 
     /// @notice WAD scalar (1e18).
     uint256 public constant WAD             = 1e18;
-    /// @notice Ceiling on the funding surcharge multiplier κ (WAD).
-    uint256 public constant MAX_UTIL_KAPPA  = 1e18;
-    /// @notice Ceiling on the hard utilization cap uMax (0.95·WAD) — keeps (WAD−U)^3 > 0.
-    uint256 public constant MAX_UMAX        = 95e16;
+    /// @notice Funding surcharge multiplier κ (WAD) — HARDCODED constant, always-on P(U). No owner knob.
+    uint256 public constant UTIL_KAPPA      = 0.05e18;
+    /// @notice Hard utilization cap (WAD) — survivability gate; also keeps (WAD−U)^3 > 0. HARDCODED.
+    uint256 public constant U_MAX           = 0.8e18;
     /// @notice Clamp on the (divergent) call-side surcharge shape (WAD).
     uint256 public constant MAX_UTIL_SHAPE  = 1000e18;
 
@@ -49,8 +49,10 @@ contract EverlastingBook {
     /// @notice adaptiveMult clamp: the integral can at most halve or triple the σ level.
     uint256 internal constant MULT_MIN      = 0.5e18;
     uint256 internal constant MULT_MAX      = 3e18;
-    /// @notice Hard cap on the owner-set integral gain k (per-period step at |U−uStar|=1).
-    uint256 public    constant MAX_ADAPT_K  = 0.1e18;
+    /// @notice Adaptive integral gain k (WAD) — HARDCODED constant (no owner knob); step at |U−U*|=1.
+    uint256 public constant ADAPT_K         = 0.02e18;
+    /// @notice Target utilization U* (WAD) for the adaptive controller — HARDCODED constant.
+    uint256 public constant U_STAR          = 0.5e18;
 
     // ── Immutables ─────────────────────────────────────────────────────────────
 
@@ -145,14 +147,7 @@ contract EverlastingBook {
     /// @dev Maintained incrementally on every collateral mutation so poolFree() stays O(1).
     uint256 public totalCollateral;
 
-    // ── Utilization-premium params (owner-set, hard-capped; P(U)) ──────────────
-
-    /// @notice Funding surcharge multiplier κ (WAD). Default 0 ⇒ surcharge OFF until owner activates.
-    uint256 public utilKappa;
-
-    /// @notice Hard utilization cap (WAD). Seeded to WAD in the constructor ⇒ no extra cap until the
-    ///         owner tightens it. 0 would brick openLong, so setUMax rejects 0 and the ctor seeds WAD.
-    uint256 public uMax;
+    // ── Vol source (immutable) ─────────────────────────────────────────────────
 
     /// @notice On-chain realized-vol source (immutable). Supplies σ to `fairMark`; the mark is the
     ///         market, not a keeper number. Wired once at construction — no owner/keeper price input.
@@ -167,15 +162,9 @@ contract EverlastingBook {
     // model. Manip-proof (U needs real size), slow + clamped (no cheap drag / oscillation).
     // Different time-scale from the P(U) surcharge (fast proportional) ⇒ no double-count.
 
-    /// @notice Per-side σ multiplier (WAD). Seeded to WAD ⇒ inert; only moves once adaptiveK>0.
+    /// @notice Per-side σ multiplier (WAD). Seeded to WAD (identity); the always-on controller moves it.
     /// @dev Keyed by uint8(Side): 0 = PUT, 1 = COVERED_CALL.
     mapping(uint8 => uint256) public adaptiveMult;
-
-    /// @notice Integral gain k (WAD). Default 0 ⇒ controller OFF until owner activates. ≤ MAX_ADAPT_K.
-    uint256 public adaptiveK;
-
-    /// @notice Target utilization U* (WAD, ∈(0,1)). Default 0.5; error = U − uStar.
-    uint256 public uStar;
 
     // ── Events ────────────────────────────────────────────────────────────────
 
@@ -199,12 +188,6 @@ contract EverlastingBook {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     /// @notice Emitted by emergencyUnwindCover; hypeWad is the tick-floored amount sold.
     event EmergencyUnwind(uint256 hypeWad);
-    /// @notice Emitted when the owner changes the utilization surcharge multiplier κ.
-    event UtilKappaSet(uint256 oldKappa, uint256 newKappa);
-    /// @notice Emitted when the owner changes the hard utilization cap uMax.
-    event UMaxSet(uint256 oldUMax, uint256 newUMax);
-    /// @notice Emitted when the owner sets the adaptive controller gain / target.
-    event AdaptiveParamsSet(uint256 k, uint256 uStar);
     /// @notice Emitted when a period folds the integral term for a side.
     event AdaptiveMultUpdated(Side indexed side, uint256 mult);
 
@@ -239,12 +222,10 @@ contract EverlastingBook {
         Kcall            = _Kcall;
         putCapNotional   = _putCapNotional;
         callCapNotional  = _callCapNotional;
-        uMax             = WAD; // fail-safe: 0 would brick openLong's u-cap
-        // Adaptive controller: seed both sides' σ multiplier to WAD (inert) and U* to 0.5. The
-        // controller stays fully off until the owner sets adaptiveK>0, so 0-default is a no-op.
+        // Adaptive controller: seed both sides' σ multiplier to WAD (identity). ADAPT_K/U_STAR are
+        // hardcoded constants, so the controller is always active; adaptiveMult is its accumulator.
         adaptiveMult[uint8(Side.PUT)]           = WAD;
         adaptiveMult[uint8(Side.COVERED_CALL)]  = WAD;
-        uStar            = 0.5e18;
     }
 
     // ── Modifiers (T8) ───────────────────────────────────────────────────────
@@ -268,34 +249,6 @@ contract EverlastingBook {
         keeper = newKeeper;
     }
 
-    /// @notice Set the funding surcharge multiplier κ (WAD). Owner only; hard-capped at MAX_UTIL_KAPPA.
-    ///         κ=0 disables the surcharge (funding reverts to pure mark−intrinsic).
-    function setUtilKappa(uint256 newKappa) external onlyOwner {
-        require(newKappa <= MAX_UTIL_KAPPA, "kappa>max");
-        emit UtilKappaSet(utilKappa, newKappa);
-        utilKappa = newKappa;
-    }
-
-    /// @notice Set the hard utilization cap uMax (WAD). Owner only; must be in (0, MAX_UMAX].
-    ///         Bounds U ≤ uMax at open, which enforces the survivability cap AND keeps the divergent
-    ///         call surcharge curve finite. Never settable to 0 (would brick openLong).
-    function setUMax(uint256 newUMax) external onlyOwner {
-        require(newUMax > 0, "uMax=0");
-        require(newUMax <= MAX_UMAX, "uMax>max");
-        emit UMaxSet(uMax, newUMax);
-        uMax = newUMax;
-    }
-
-    /// @notice Set the adaptive controller gain k and target utilization uStar (owner only).
-    /// @dev k is hard-capped at MAX_ADAPT_K; k=0 leaves the controller inert. uStar ∈ (0, WAD).
-    ///      Does NOT reset adaptiveMult — the integral persists across param changes.
-    function setAdaptiveParams(uint256 k, uint256 uStar_) external onlyOwner {
-        require(k <= MAX_ADAPT_K, "k>max");
-        require(uStar_ > 0 && uStar_ < WAD, "uStar range");
-        adaptiveK = k;
-        uStar = uStar_;
-        emit AdaptiveParamsSet(k, uStar_);
-    }
 
     // ── On-chain fair-value mark (BS everlasting + put-skew) ──────────────────
 
@@ -311,8 +264,8 @@ contract EverlastingBook {
     }
 
     /// @notice Apply the adaptive integral to the realized σ (Phase 2), clamped [SIGMA_FLOOR, SIGMA_CEIL].
-    /// @dev A per-side level-shift on σ. Multiplier defaults to WAD (inert fast path). Feeds fairMark
-    ///      below the ±band, so the keeper mark still can't stray from the adjusted fair value.
+    /// @dev A per-side level-shift on σ. Multiplier defaults to WAD (identity). Feeds fairMark, which
+    ///      IS the mark — there is no keeper number to bound (the mark is computed, not posted).
     function _adaptiveSigma(Side side, uint256 sig) internal view returns (uint256) {
         uint256 mult = adaptiveMult[uint8(side)];
         if (mult == WAD) return sig; // inert
@@ -331,8 +284,8 @@ contract EverlastingBook {
     ///         clamped [MULT_MIN, MULT_MAX]. Called from accrue each period. Signed: under-target
     ///         demand (U<uStar) cheapens, over-target richens.
     function _updateAdaptiveMult(Side side, uint256 periods) internal {
-        int256 err = int256(utilization(side)) - int256(uStar);          // ∈ [−uStar, WAD−uStar]
-        int256 step = (int256(adaptiveK) * err / int256(WAD)) * int256(periods);
+        int256 err = int256(utilization(side)) - int256(U_STAR);         // ∈ [−U_STAR, WAD−U_STAR]
+        int256 step = (int256(ADAPT_K) * err / int256(WAD)) * int256(periods);
         int256 nv = int256(adaptiveMult[uint8(side)]) + step;
         if (nv < int256(MULT_MIN)) nv = int256(MULT_MIN);
         if (nv > int256(MULT_MAX)) nv = int256(MULT_MAX);
@@ -490,9 +443,8 @@ contract EverlastingBook {
     ///         when utilKappa==0 or U==0. Purely a function of internal state — references no oracle.
     /// @dev WAD math: shape_call = 2·U·WAD^3/(WAD−U)^3, rescaled by (1e6)^3=1e18 in the denominator so
     ///      intermediates stay < 2^256 and near-saturation rounds the denominator to 0 → clamp. The
-    ///      hard uMax cap + MAX_UMAX keep U<WAD in normal flow; the clamp is belt-and-suspenders.
+    ///      the hard U_MAX cap keeps U<WAD in normal flow; the clamp is belt-and-suspenders.
     function _utilSurcharge(Side side) internal view returns (uint256) {
-        if (utilKappa == 0) return 0; // no-op fast path: change is inert until owner activates
         uint256 U = utilization(side);
         if (U == 0) return 0;
 
@@ -513,7 +465,7 @@ contract EverlastingBook {
                 if (shape > MAX_UTIL_SHAPE) shape = MAX_UTIL_SHAPE;
             }
         }
-        return utilKappa * shape / WAD;
+        return UTIL_KAPPA * shape / WAD;
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -566,7 +518,7 @@ contract EverlastingBook {
             require(ps.netWritten <= putCapNotional, "cap");        // WAD cap on open put qty
             // Hard utilization cap: netWritten ≤ uMax·cap. Overflow-safe: netWritten·WAD ≤ ~1e38.
             // forge-lint: disable-next-line(divide-before-multiply) -- intentional cross-multiply
-            require(ps.netWritten * WAD <= uMax * putCapNotional, "u-cap");
+            require(ps.netWritten * WAD <= U_MAX * putCapNotional, "u-cap");
 
             positions[sp][msg.sender] = Position(qty, ps.mark, ps.cumFunding);
             emit Opened(Side.PUT, msg.sender, qty, ps.mark);
@@ -588,7 +540,7 @@ contract EverlastingBook {
         require(ss.netWritten + qty <= callCapNotional, "cap");
         // Hard utilization cap: (netWritten+qty) ≤ uMax·cap. Overflow-safe: ·WAD ≤ ~1e38.
         // forge-lint: disable-next-line(divide-before-multiply) -- intentional cross-multiply
-        require((ss.netWritten + qty) * WAD <= uMax * callCapNotional, "u-cap");
+        require((ss.netWritten + qty) * WAD <= U_MAX * callCapNotional, "u-cap");
 
         ss.netWritten += qty;
         positions[uint8(side)][msg.sender] = Position(qty, ss.mark, ss.cumFunding);
@@ -794,7 +746,7 @@ contract EverlastingBook {
     }
 
     /// @notice Permissionless force-close when the position's net loss exceeds collateral (I2).
-    ///         Anyone may call this once a position is insolvent; keeper may call during mark updates.
+    ///         Anyone may call this once a position is insolvent.
     function settle(Side side, address t) external {
         require(positions[uint8(side)][t].qty > 0, "no position");
         require(netLossUsdc(side, t) > traderCollateral[uint8(side)][t], "solvent");
