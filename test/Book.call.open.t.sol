@@ -176,16 +176,23 @@ contract BookCallOpenTest is Test {
         book.openLong(CALL, 1e18);
         uint256 markAtEntry = _mark(CALL);
 
+        // Compute the always-on P(U) surcharge (Task 6: UTIL_KAPPA constant, not togglable).
+        // U = 1e18/10_000e18 = 1e14; P_call(U) = 2U/(WAD−U)^3 (WAD-rescaled).
+        uint256 U  = book.utilization(CALL); // = 1e14
+        uint256 dn = (1e18 - U) / 1e6;
+        dn = dn * dn * dn;
+        uint256 surcharge = book.UTIL_KAPPA() * (2 * U * 1e36 / dn) / 1e18;
+
         // Advance exactly one FUNDING_PERIOD; spot unchanged ⇒ mark constant.
         vm.warp(block.timestamp + book.FUNDING_PERIOD());
         book.accrue(CALL);
 
-        // cumFunding += (mark − 0) × 1 = mark
+        // cumFunding += (mark − intrinsic + surcharge) × 1; intrinsic=0 at S=100<Kcall=120.
         (, , uint256 cf, , ) = book.sideState(CALL_U);
-        assertEq(cf, markAtEntry, "cumFunding after 1 period == mark");
+        assertEq(cf, markAtEntry + surcharge, "cumFunding after 1 period == mark + P(U) surcharge");
 
-        // pendingFunding = qty × (cumFunding − entryCumFunding) / 1e18 = mark
-        assertEq(book.pendingFunding(CALL, address(this)), markAtEntry, "pendingFunding == mark");
+        // pendingFunding = qty × (cumFunding − entryCumFunding) / 1e18 = mark + surcharge
+        assertEq(book.pendingFunding(CALL, address(this)), markAtEntry + surcharge, "pendingFunding == mark + P(U) surcharge");
     }
 
     /// @dev pendingFunding returns 0 for an address with no position.

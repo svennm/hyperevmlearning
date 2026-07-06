@@ -247,32 +247,9 @@ contract BookInvariantHandler is Test {
         try book.unpause() {} catch {}
     }
 
-    // ── Utilization-premium params: exercise the P(U) surcharge under the conservation fuzz ──
-    //
-    // The handler owns the book, so it may set κ/uMax. Turning the surcharge ON across the campaign
-    // proves usdcConservation holds with the surcharge path live (the surcharge only ever INCREASES
-    // funding owed = trader→pool, floored at collateral on the loss branch, so it can never underflow
-    // poolFree — but the fuzz verifies that structurally rather than by argument).
-
-    function setUtilParams(uint256 kSeed, uint256 uSeed) external {
-        uint256 k = bound(kSeed, 0, book.MAX_UTIL_KAPPA());
-        uint256 u = bound(uSeed, 1, book.MAX_UMAX());
-        try book.setUtilKappa(k) {} catch {}
-        try book.setUMax(u) {} catch {}
-    }
-
-    // ── Adaptive controller params: exercise the Phase-2 integral under the conservation fuzz ──
-    //
-    // _updateAdaptiveMult touches ONLY adaptiveMult (a control variable) — no USDC/escrow/collateral
-    // moves — so it can't affect conservation by construction. Fuzzing it with random k/uStar across
-    // the campaign proves the signed integral math (int256 cast + clamp) never overflows or reverts
-    // for any (U, periods) the campaign reaches.
-
-    function setAdaptiveParams(uint256 kSeed, uint256 uSeed) external {
-        uint256 k = bound(kSeed, 0, book.MAX_ADAPT_K());
-        uint256 u = bound(uSeed, 1, 1e18 - 1);
-        try book.setAdaptiveParams(k, u) {} catch {}
-    }
+    // ── P(U) surcharge + adaptive controller are now ALWAYS-ON (hardcoded UTIL_KAPPA / U_MAX /
+    //    ADAPT_K / U_STAR constants), so the conservation fuzz exercises BOTH paths by default every
+    //    campaign — the owner setters were removed in the autonomy pass, so no setter action is needed.
 
     // ── Spot driver: sweep across [1, 1000*Kcall] AND crash toward 0 ──────────
 

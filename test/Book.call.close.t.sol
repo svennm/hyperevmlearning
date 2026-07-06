@@ -262,14 +262,22 @@ contract BookCallCloseTest is Test {
     ///      downward mark move adds markLoss, making netLoss > collateral while funding alone is not.
     function test_settle_fires_mark_loss_insolvency() public {
         uint256 markC0 = _mark(CALL);           // S=100 entry mark
-        uint256 im     = 1e18 * markC0 / 1e18 / 1e12; // IM = _toUsdc(qty·mark)
+        // After ALICE opens, netWritten = 2e18, U = 2e18/10_000e18 = 2e14.
+        // Precompute the P(U) surcharge at U=2e14 (Task 6: UTIL_KAPPA always-on constant).
+        // im must equal the full funding/period (mark + surcharge) to maintain the knife-edge
+        // where fundingAlone == collateral (a funding-only predicate would just-not-fire).
+        uint256 U2 = 2e18 * 1e18 / 10_000e18; // = 2e14; callCap constant from setUp
+        uint256 dn = (1e18 - U2) / 1e6;
+        dn = dn * dn * dn;
+        uint256 surcharge = book.UTIL_KAPPA() * (2 * U2 * 1e36 / dn) / 1e18;
+        uint256 im = (markC0 + surcharge) / 1e12; // full funding/period: knife-edge restored
 
         vm.prank(ALICE);
-        book.deposit(CALL, im);                 // collateral == IM exactly
+        book.deposit(CALL, im);                 // collateral == full funding/period exactly
         vm.prank(ALICE);
         book.openLong(CALL, 1e18);              // entryMark = markC0, entryCumFunding = 0
 
-        // One funding period at unchanged spot ⇒ cumFunding += markC0 ⇒ fundingU == im == collateral.
+        // One funding period ⇒ cumFunding += markC0 + surcharge ⇒ fundingU == im == collateral.
         vm.warp(block.timestamp + book.FUNDING_PERIOD());
         book.accrue(CALL);
         // Same-block downward move adds markLoss without extra funding.
