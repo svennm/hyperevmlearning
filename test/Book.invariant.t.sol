@@ -12,10 +12,10 @@ import {MockVol} from "../src/mocks/MockVol.sol";
 ///         pool: LP liquidity, cover buying, per-side deposit/open/mark/close/settle/withdraw, and
 ///         a spot driver that sweeps HYPE price across [1, 1000*Kcall] AND down toward 0.
 ///
-///         The handler is the book's keeper (nonce-predicted in setUp), so it may postMark.
+///         The mark is autonomous (mark = fairMark() via permissionless accrue()); the handler pokes
+///         accrue on both sides so funding + the always-on P(U)/adaptive controller fold each period.
 ///         Model soundness: `moveSpot`/`crashSpot` set BOTH the option oracle and the vault cover
-///         price to the SAME spot (the underlying of a HYPE option IS HYPE), and call marks are
-///         capped at spot (a call is never worth more than the underlying). Opens are made reachable
+///         price to the SAME spot (the underlying of a HYPE option IS HYPE). Opens are made reachable
 ///         by seeding cover + pool-free + collateral generously right before each attempt.
 contract BookInvariantHandler is Test {
     EverlastingBook public book;
@@ -168,16 +168,16 @@ contract BookInvariantHandler is Test {
         vm.stopPrank();
     }
 
-    // ── Mark posting (both sides) ─────────────────────────────────────────────
+    // ── Accrue (both sides): advance a funding period + fold the autonomous mark ──────────
 
-    function postMarkCall(uint256) external {
-        // Autonomous mark: advance a funding period, then accrue (folds funding + refreshes
-        // mark = fairMark(CALL)). The spot driver (moveSpot/crashSpot) varies the mark, not a keeper.
+    function accrueCall(uint256) external {
+        // Advance a funding period, then accrue (folds funding + the always-on P(U)/adaptive
+        // controller, refreshes mark = fairMark(CALL)). moveSpot/crashSpot vary the mark, not a keeper.
         vm.warp(block.timestamp + book.FUNDING_PERIOD());
         try book.accrue(CALL) { marksCallPosted++; } catch {}
     }
 
-    function postMarkPut(uint256) external {
+    function accruePut(uint256) external {
         vm.warp(block.timestamp + book.FUNDING_PERIOD());
         try book.accrue(PUT) { marksPutPosted++; } catch {}
     }
