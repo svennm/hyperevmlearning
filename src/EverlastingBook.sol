@@ -440,10 +440,10 @@ contract EverlastingBook {
 
     /// @notice Per-period funding surcharge κ·P(U) for the given side (WAD). PUT: P=U (linear,
     ///         ceiling at U=1). CALL: P=2U/(1−U)^3 (divergent), clamped at MAX_UTIL_SHAPE. Returns 0
-    ///         when utilKappa==0 or U==0. Purely a function of internal state — references no oracle.
+    ///         when U==0. Purely a function of internal state — references no oracle.
     /// @dev WAD math: shape_call = 2·U·WAD^3/(WAD−U)^3, rescaled by (1e6)^3=1e18 in the denominator so
     ///      intermediates stay < 2^256 and near-saturation rounds the denominator to 0 → clamp. The
-    ///      the hard U_MAX cap keeps U<WAD in normal flow; the clamp is belt-and-suspenders.
+    ///      hard U_MAX cap keeps U<WAD in normal flow; the clamp is belt-and-suspenders.
     function _utilSurcharge(Side side) internal view returns (uint256) {
         uint256 U = utilization(side);
         if (U == 0) return 0;
