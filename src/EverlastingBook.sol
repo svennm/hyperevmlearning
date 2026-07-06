@@ -3,8 +3,8 @@ pragma solidity 0.8.35;
 
 import {ISpotOracle} from "./interfaces/ISpotOracle.sol";
 import {ICoverVault} from "./interfaces/ICoverVault.sol";
+import {IVolSource} from "./interfaces/IVolSource.sol";
 import {OptionMath} from "./OptionMath.sol";
-import {RealizedVol} from "./RealizedVol.sol";
 import {FixedPointMathLib} from "solady/utils/FixedPointMathLib.sol";
 
 /// @title EverlastingBook
@@ -19,8 +19,6 @@ contract EverlastingBook {
     // ── Constants ─────────────────────────────────────────────────────────────
 
     uint256 public constant FUNDING_PERIOD   = 3600;   // seconds (1 hour)
-    uint256 public constant MAX_MARK_AGE     = 7200;   // seconds (2 hours)
-    uint256 public constant MAX_MARK_DEV_BPS = 2000;   // 20% max deviation per update
 
     // ── Utilization-premium funding (P(U), AmPO-style) ────────────────────────
 
@@ -33,10 +31,8 @@ contract EverlastingBook {
     /// @notice Clamp on the (divergent) call-side surcharge shape (WAD).
     uint256 public constant MAX_UTIL_SHAPE  = 1000e18;
 
-    // ── On-chain fair-value mark (kills H2: keeper mark is band-bound to on-chain BS fair value) ──
+    // ── On-chain fair-value mark (autonomous: the mark IS the on-chain BS fair value) ──
 
-    /// @notice Half-width of the fair-value band (bps). Keeper mark must be within ±this of `fairMark`.
-    uint256 internal constant MARK_BAND_BPS = 1000;    // ±10%
     /// @notice Put-skew steepness β: σ_eff = σ·(1 + β·ln(S/K)₊) for OTM puts (crash premium).
     uint256 internal constant BETA_PUT      = 0.5e18;
     /// @notice Everlasting basket base maturity (WAD years, ~1 week); maturities double per term.
@@ -64,7 +60,8 @@ contract EverlastingBook {
     /// @notice Spot price oracle (WAD).
     ISpotOracle public immutable oracle;
 
-    /// @notice Privileged address permitted to post marks (mutable; settable by owner).
+    /// @notice Privileged address for the cover-trigger role (mutable; settable by owner).
+    /// @dev The mark path is fully autonomous (computed on-chain); the keeper no longer gates any price.
     address public keeper;
 
     /// @notice PUT strike (WAD).
@@ -98,9 +95,9 @@ contract EverlastingBook {
     /// @notice Per-side market state (independent marks, funding, and open interest).
     struct SideState {
         uint256 mark;          // WAD — current mid-market mark price
-        uint256 lastMarkTime;  // unix timestamp of last postMark
+        uint256 lastMarkTime;  // unix timestamp of last accrue
         uint256 cumFunding;    // WAD — cumulative funding per unit qty
-        uint256 lastIntrinsic; // WAD — intrinsic sampled at last postMark
+        uint256 lastIntrinsic; // WAD — intrinsic sampled at last accrue
         uint256 netWritten;    // WAD — total qty open (long) on this side
     }
 
@@ -157,13 +154,13 @@ contract EverlastingBook {
     ///         owner tightens it. 0 would brick openLong, so setUMax rejects 0 and the ctor seeds WAD.
     uint256 public uMax;
 
-    /// @notice On-chain realized-vol source. address(0) ⇒ band inactive (bootstrap: old deviation cap).
-    ///         Once set AND ready(), postMark bounds the keeper mark to ±MARK_BAND_BPS of fairMark().
-    RealizedVol public vol;
+    /// @notice On-chain realized-vol source (immutable). Supplies σ to `fairMark`; the mark is the
+    ///         market, not a keeper number. Wired once at construction — no owner/keeper price input.
+    IVolSource public immutable vol;
 
     // ── Adaptive vol controller params (Phase 2; per-side, owner-set) ──────────
     //
-    // Integral of the demand error, folded once per funding period in postMark:
+    // Integral of the demand error, folded once per funding period in accrue:
     //   adaptiveMult[side] += k·(U − uStar)·periods,  clamped [MULT_MIN, MULT_MAX]
     // and applied as a σ level-shift in fairMark (below the ±band). Persistent over-target
     // demand ⇒ mult climbs ⇒ mark richens ⇒ demand cools at uStar → vol is set by flow, not the
@@ -206,8 +203,6 @@ contract EverlastingBook {
     event UtilKappaSet(uint256 oldKappa, uint256 newKappa);
     /// @notice Emitted when the owner changes the hard utilization cap uMax.
     event UMaxSet(uint256 oldUMax, uint256 newUMax);
-    /// @notice Emitted when the owner wires (or rewires) the realized-vol source.
-    event VolSet(address indexed vol);
     /// @notice Emitted when the owner sets the adaptive controller gain / target.
     event AdaptiveParamsSet(uint256 k, uint256 uStar);
     /// @notice Emitted when a period folds the integral term for a side.
@@ -223,7 +218,8 @@ contract EverlastingBook {
         uint256     _Wput,
         uint256     _Kcall,
         uint256     _putCapNotional,
-        uint256     _callCapNotional
+        uint256     _callCapNotional,
+        IVolSource  _vol
     ) {
         require(address(_vault)  != address(0), "vault=0");
         require(address(_oracle) != address(0), "oracle=0");
@@ -231,11 +227,13 @@ contract EverlastingBook {
         require(_Kput  > 0, "Kput=0");
         require(_Wput  > 0, "Wput=0");
         require(_Kcall > 0, "Kcall=0");
+        require(address(_vol) != address(0), "vol=0");
 
         owner            = msg.sender;
         vault            = _vault;
         oracle           = _oracle;
         keeper           = _keeper;
+        vol              = _vol;
         Kput             = _Kput;
         Wput             = _Wput;
         Kcall            = _Kcall;
@@ -288,13 +286,6 @@ contract EverlastingBook {
         uMax = newUMax;
     }
 
-    /// @notice Wire the on-chain realized-vol source (owner only). Once set and `vol.ready()`, the
-    ///         keeper mark is bound to the on-chain fair value in postMark. Pass address(0) to disable.
-    function setVol(RealizedVol newVol) external onlyOwner {
-        vol = newVol;
-        emit VolSet(address(newVol));
-    }
-
     /// @notice Set the adaptive controller gain k and target utilization uStar (owner only).
     /// @dev k is hard-capped at MAX_ADAPT_K; k=0 leaves the controller inert. uStar ∈ (0, WAD).
     ///      Does NOT reset adaptiveMult — the integral persists across param changes.
@@ -337,7 +328,7 @@ contract EverlastingBook {
     }
 
     /// @notice Fold one demand-error step into the side's adaptive integral: mult += k·(U−uStar)·periods,
-    ///         clamped [MULT_MIN, MULT_MAX]. Called from postMark under adaptiveK>0. Signed: under-target
+    ///         clamped [MULT_MIN, MULT_MAX]. Called from accrue each period. Signed: under-target
     ///         demand (U<uStar) cheapens, over-target richens.
     function _updateAdaptiveMult(Side side, uint256 periods) internal {
         int256 err = int256(utilization(side)) - int256(uStar);          // ∈ [−uStar, WAD−uStar]
@@ -424,7 +415,7 @@ contract EverlastingBook {
     }
 
     /// @notice Pause new openLong on both sides. Exit paths (close/settle/withdraw/lpWithdraw/
-    ///         postMark/deposit) remain fully open — pause is a de-risk switch, never a fund trap.
+    ///         accrue/deposit) remain fully open — pause is a de-risk switch, never a fund trap.
     function pause() external onlyOwner {
         paused = true;
         emit Paused(msg.sender);
@@ -548,19 +539,22 @@ contract EverlastingBook {
     // ── openLong ──────────────────────────────────────────────────────────────
 
     /// @notice Open a long position on the given side.
-    /// @dev PUT (slice-2 escrow model): fresh mark, one position per (side, trader),
-    ///      escrow IM = qty·Wput of the trader's collateral, and the pool locks a matching
-    ///      qty·Wput of its OWN free USDC as escrow (fully collateralized). Cap on open qty.
-    ///      COVERED_CALL: fresh mark required, one position per (side, trader), premium IM check,
-    ///      D3 cover gate reads vault.coverHype() on-chain (not optimistic local state), cap check.
+    /// @dev Both branches auto-accrue first (autonomous mark): the entry mark is the on-chain computed
+    ///      fair value, so no keeper/staleness gate is needed. accrue reverts if the oracle is dead
+    ///      (spot==0) — correct: don't open into a dead oracle.
+    ///      PUT (slice-2 escrow model): one position per (side, trader), escrow IM = qty·Wput of the
+    ///      trader's collateral, and the pool locks a matching qty·Wput of its OWN free USDC as escrow
+    ///      (fully collateralized). Cap on open qty.
+    ///      COVERED_CALL: one position per (side, trader), premium IM check, D3 cover gate reads
+    ///      vault.coverHype() on-chain (not optimistic local state), cap check.
     function openLong(Side side, uint256 qty) external whenNotPaused {
         if (side == Side.PUT) {
             // ── PUT branch (port of EverlastingMarket.openLong) ──────────────
             uint8 sp = uint8(Side.PUT);
             SideState storage ps = sideState[sp];
+            accrue(side);                            // autonomous mark: refresh + fold funding first
             require(qty > 0, "qty=0");
             require(ps.mark > 0, "no mark");
-            require(block.timestamp <= ps.lastMarkTime + MAX_MARK_AGE, "stale mark");
             require(positions[sp][msg.sender].qty == 0, "one position");
 
             uint256 im = _toUsdc(qty * Wput / 1e18);                // escrow IM = qty·W
@@ -581,9 +575,9 @@ contract EverlastingBook {
 
         // COVERED_CALL branch
         SideState storage ss = sideState[uint8(side)];
+        accrue(side);                                // autonomous mark: refresh + fold funding first
         require(qty > 0, "qty=0");
         require(ss.mark > 0, "no mark");
-        require(block.timestamp <= ss.lastMarkTime + MAX_MARK_AGE, "stale mark");
         require(positions[uint8(side)][msg.sender].qty == 0, "one position");
         require(
             traderCollateral[uint8(side)][msg.sender] >= _toUsdc(qty * ss.mark / 1e18),
@@ -599,77 +593,6 @@ contract EverlastingBook {
         ss.netWritten += qty;
         positions[uint8(side)][msg.sender] = Position(qty, ss.mark, ss.cumFunding);
         emit Opened(side, msg.sender, qty, ss.mark);
-    }
-
-    // ── postMark ──────────────────────────────────────────────────────────────
-
-    /// @notice Keeper posts a new mark price for the given side.
-    /// @dev PUT: keeper-gated, ≤Wput upper clamp (slice-2 payout cap), deviation +
-    ///      recoverable-staleness guards, F3 funding advance using contemporaneous lastIntrinsic.
-    ///      COVERED_CALL: keeper-gated, uncapped (no ≤W), deviation + recoverable-staleness guards,
-    ///      F3 funding advance using contemporaneous lastIntrinsic.
-    ///      The deviation/staleness/funding block below is shared and behaviourally identical for
-    ///      both sides; the ONLY per-side difference is the PUT ≤Wput clamp.
-    function postMark(Side side, uint256 newMark) external {
-        require(msg.sender == keeper, "only keeper");
-
-        SideState storage ss = sideState[uint8(side)];
-        uint256 intr = intrinsic(side);
-        require(newMark >= intr, "mark<intrinsic");
-        if (side == Side.PUT) {
-            require(newMark <= Wput, "mark>W"); // PUT-side payout clamp (slice-2); call side uncapped
-        }
-
-        bool isFresh = (ss.mark != 0) && (block.timestamp <= ss.lastMarkTime + MAX_MARK_AGE);
-
-        // H2 fix: once vol is wired + ready, bound the keeper mark to ±MARK_BAND_BPS of the on-chain
-        // fair value — an ABSOLUTE anchor, so the keeper can't ramp the mark (the old cap was relative
-        // to the previous mark and compounded). Bootstrap (vol not ready) keeps the old deviation cap.
-        bool bandActive = address(vol) != address(0) && vol.ready();
-        if (bandActive) {
-            uint256 fair = fairMark(side);
-            uint256 loB = fair * (10_000 - MARK_BAND_BPS) / 10_000;
-            uint256 hiB = fair * (10_000 + MARK_BAND_BPS) / 10_000;
-            // AUDIT-H (crash brick): a capped put SPREAD's fair value can dip BELOW its own intrinsic
-            // near the short strike (the short leg's extrinsic), so the band and the newMark≥intrinsic
-            // floor could have an EMPTY intersection — bricking PUT postMark exactly during a crash.
-            // Floor both bounds at intrinsic so a valid mark (≥ intr) always exists; funding→0 there.
-            if (loB < intr) loB = intr;
-            if (hiB < intr) hiB = intr;
-            require(newMark >= loB && newMark <= hiB, "mark band");
-        }
-
-        if (isFresh) {
-            if (!bandActive) {
-                uint256 hi = ss.mark + ss.mark * MAX_MARK_DEV_BPS / 10_000;
-                uint256 lo = ss.mark - ss.mark * MAX_MARK_DEV_BPS / 10_000;
-                require(newMark <= hi && newMark >= lo, "mark deviation");
-            }
-
-            uint256 age = block.timestamp - ss.lastMarkTime;
-            uint256 periods = age / FUNDING_PERIOD;
-            if (periods > 0) {
-                // F3: contemporaneous lastIntrinsic from the prior mark time
-                uint256 f = ss.mark >= ss.lastIntrinsic ? ss.mark - ss.lastIntrinsic : 0;
-                f += _utilSurcharge(side); // P(U): endogenous concentration surcharge (0 when κ=0)
-                ss.cumFunding += f * periods;
-                // Phase 2: fold the demand-error integral (inert while adaptiveK==0).
-                if (adaptiveK > 0) _updateAdaptiveMult(side, periods);
-            }
-        }
-
-        ss.mark = newMark;
-        ss.lastMarkTime = block.timestamp;
-        ss.lastIntrinsic = intr;
-        emit MarkPosted(side, newMark, ss.cumFunding);
-
-        // F1 (σ liveness): sample σ at every mark so a spike present at mark-time is folded in,
-        // reducing reliance on a separate off-chain observer. Placed AFTER the band check above so
-        // it can never move THIS post's band — only refresh σ for future marks. try/catch so a
-        // transient vol revert (e.g. px=0) can never brick the keeper's mark.
-        if (address(vol) != address(0)) {
-            try vol.updateVol() {} catch {}
-        }
     }
 
     // ── pendingFunding ────────────────────────────────────────────────────────
@@ -808,7 +731,7 @@ contract EverlastingBook {
     ///
     ///      F2 (escrow-release-FIRST, no-false-revert): the put's qty·W escrow is released back to
     ///      poolFree BEFORE the payout is credited. Because any winning payout g is bounded by
-    ///      qty·(mark−entryMark) ≤ qty·W = escrow (mark ≤ Wput is enforced at postMark), releasing
+    ///      qty·(mark−entryMark) ≤ qty·W = escrow (mark ≤ Wput is enforced by _computedMark), releasing
     ///      first guarantees poolFree ≥ g — the credit can never underflow poolFree / false-revert.
     ///
     ///      Shared pool: no vault cash moves on a put close. Only the logical ledgers rebalance —

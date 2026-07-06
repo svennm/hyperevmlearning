@@ -3,7 +3,6 @@ pragma solidity 0.8.35;
 
 import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
-import {RealizedVol} from "../src/RealizedVol.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 import {MockVol} from "../src/mocks/MockVol.sol";
@@ -27,7 +26,10 @@ contract BookAccrueTest is Test {
         oracle  = new MockOracle();
         oracle.set(100e18); // baseline spot; overridden per-test
 
-        // keeper = owner = address(this) for simplicity (no onlyKeeper calls here)
+        // MockVol supplies σ to the autonomous mark (defaults: sigma=0.8e18, ready=true).
+        mockVol = new MockVol();
+
+        // keeper = owner = address(this) for simplicity (no keeper-gated calls here)
         book = new EverlastingBook(
             ICoverVault(address(vault)),
             ISpotOracle(address(oracle)),
@@ -36,13 +38,9 @@ contract BookAccrueTest is Test {
             20e18,          // Wput
             120e18,         // Kcall — with S=33 both sides are OTM (call) / deep ITM (put)
             100e18,         // putCapNotional
-            100e18          // callCapNotional
+            100e18,         // callCapNotional
+            mockVol         // vol source (autonomous mark)
         );
-
-        // Wire MockVol via cast — setVol accepts RealizedVol but any contract with the
-        // same ABI (sigma/ready/updateVol) works at runtime. MockVol defaults: sigma=0.8e18, ready=true.
-        mockVol = new MockVol();
-        book.setVol(RealizedVol(address(mockVol)));
     }
 
     // ── Step 1 tests (written before implementation — will FAIL until accrue is added) ──

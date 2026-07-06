@@ -6,6 +6,7 @@ import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {EvmUsdcCoverVault} from "../src/EvmUsdcCoverVault.sol";
 import {MockUSDC} from "../src/MockUSDC.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {PrecompileLib} from "@hyper-evm-lib/src/PrecompileLib.sol";
 import {CoreSimulatorLib} from "@hyper-evm-lib/test/simulation/CoreSimulatorLib.sol";
@@ -48,6 +49,7 @@ contract BookEvmVaultIntegrationTest is Test {
 
     MockUSDC          usdc;
     MockOracle        oracle;
+    MockVol           mockVol;
     EvmUsdcCoverVault vault;
     EverlastingBook   book;
     HyperCore         hyperCore;
@@ -81,11 +83,13 @@ contract BookEvmVaultIntegrationTest is Test {
         oracle = new MockOracle();
         oracle.set(100e18); // spot $100
 
+        mockVol = new MockVol();
         vault = new EvmUsdcCoverVault(IERC20(address(usdc)), address(this)); // owner+keeper = this
         book  = new EverlastingBook(
             vault, oracle, address(this), // book mark-keeper = this
             KPUT, WPUT, KCALL,
-            10_000e18, 10_000e18
+            10_000e18, 10_000e18,
+            mockVol
         );
         // Book is the vault's sole fund-exit authority (pullUsdc/payoutUsdc onlyBook, sellCover
         // book-or-keeper). Keeper stays = this (owner) for cover-buy / bridge ops.
@@ -115,6 +119,17 @@ contract BookEvmVaultIntegrationTest is Test {
             book.poolFree() + book.putEscrow() + book.totalCollateral(),
             tag
         );
+    }
+
+    function _mark() internal view returns (uint256 m) {
+        (m,,,,) = book.sideState(CALL_U);
+    }
+
+    /// @dev Exact ceil-to-tick cover sale for a gain `g` (6dp), at the vault's live spot px.
+    function _sellFor(uint256 g) internal view returns (uint256 sellHype) {
+        uint256 px = vault.spotPxUsdc();
+        uint256 hypeForG = (g * 1e12) * 1e18 / px;
+        sellHype = ((hypeForG + 1e16 - 1) / 1e16) * 1e16;
     }
 
     // ── THE FIX in isolation: deposit via transferFrom ────────────────────────
@@ -157,17 +172,22 @@ contract BookEvmVaultIntegrationTest is Test {
         book.deposit(CALL, 1_000e6);
         _assertConservation("after deposit");
 
-        // 2) Mark + open (cover gate: coverHype 100 >= qty 1)
+        // 2) Open at the S=100 autonomous mark (cover gate: coverHype 100 >= qty 1)
         vm.warp(100);
-        book.postMark(CALL, 5e18);
+        book.accrue(CALL);
+        uint256 entry = _mark();
         vm.prank(ALICE);
         book.openLong(CALL, 1e18);
         (uint256 qty,,) = book.positions(CALL_U, ALICE);
         assertEq(qty, 1e18, "position opened");
 
-        // 3) Winning mark 5 → 6 (within 20% deviation)
-        vm.warp(101);
-        book.postMark(CALL, 6e18);
+        // 3) Winning move: drive the oracle up (fairMark(CALL) rises); same block ⇒ no funding.
+        oracle.set(110e18);
+        book.accrue(CALL);
+        uint256 exit = _mark();
+        assertGt(exit, entry, "mark rose with spot (winning)");
+        uint256 g = 1e18 * (exit - entry) / 1e18 / 1e12;
+        uint256 sellHype = _sellFor(g);
 
         // 4) Close (winning): book (keeper) sells cover on Core; settle the async fill.
         uint256 coverBefore = vault.coverHype();
@@ -175,15 +195,14 @@ contract BookEvmVaultIntegrationTest is Test {
         book.close(CALL);           // sellCover placed (async) + g credited from existing poolFree
         CoreSimulatorLib.nextBlock(); // cover-sale proceeds land on the Core float
 
-        // g = 1e6; exactly one 0.01-HYPE tick sold to fund it.
-        assertEq(book.traderCollateral(CALL_U, ALICE), 1_000e6 + 1e6, "trader credited g=1 USDC");
-        assertEq(vault.coverHype(), coverBefore - 1e16, "cover sold: one 0.01-HYPE tick");
+        assertEq(book.traderCollateral(CALL_U, ALICE), 1_000e6 + g, "trader credited g");
+        assertEq(vault.coverHype(), coverBefore - sellHype, "cover sold = ceil-to-tick(hypeForG)");
         (uint256 qtyAfter,,) = book.positions(CALL_U, ALICE);
         assertEq(qtyAfter, 0, "position closed");
         _assertConservation("after winning close (settled)");
 
         // 5) Withdraw — physical USDC payout via ERC20 transfer from the EVM buffer.
-        uint256 payout = book.traderCollateral(CALL_U, ALICE); // 1001 USDC
+        uint256 payout = book.traderCollateral(CALL_U, ALICE); // 1000 + g
         uint256 vaultEvmBefore = usdc.balanceOf(address(vault));
         vm.prank(ALICE);
         book.withdraw(CALL, payout);
@@ -193,8 +212,8 @@ contract BookEvmVaultIntegrationTest is Test {
         assertEq(book.traderCollateral(CALL_U, ALICE), 0,       "collateral fully withdrawn");
         _assertConservation("after withdraw");
 
-        // Trader net: deposited 1000, withdrew 1001 → +1 USDC winning realized end-to-end.
-        assertEq(usdc.balanceOf(ALICE), 1_001e6, "trader realized +1 USDC winning");
+        // Trader net: deposited 1000, withdrew 1000+g → realized +g winning end-to-end.
+        assertEq(usdc.balanceOf(ALICE), 1_000e6 + g, "trader realized +g winning");
     }
 
     /// @notice Losing close also flows through the EVM-custody vault: loss accrues to the pool,
@@ -207,26 +226,34 @@ contract BookEvmVaultIntegrationTest is Test {
         book.deposit(CALL, 1_000e6);
 
         vm.warp(100);
-        book.postMark(CALL, 5e18);
+        // Entry regime: spot below Kcall ($120) so the call is OTM (mark is pure extrinsic).
+        oracle.set(110e18);
+        book.accrue(CALL);
+        uint256 entryMark = book.fairMark(CALL); // == the mark openLong records
         vm.prank(ALICE);
         book.openLong(CALL, 1e18);
 
-        // Mark falls 5 → 4 (stale-mark path to bypass deviation guard), l = 1 USDC.
-        vm.warp(100 + book.MAX_MARK_AGE() + 1);
-        book.postMark(CALL, 4e18);
+        // Autonomous mark falls: drop spot so fairMark(CALL) declines → losing close.
+        // No time warp between open and this accrue ⇒ zero funding, pure markLoss.
+        oracle.set(90e18);
+        book.accrue(CALL);
+        uint256 exitMark = book.fairMark(CALL);
+        uint256 expLoss = (entryMark - exitMark) / 1e12; // qty=1e18 → _toUsdc(Δmark)
+        assertGt(expLoss, 0, "mark fell -> loss");
 
         uint256 coverBefore = vault.coverHype();
         vm.prank(ALICE);
         book.close(CALL);
 
-        assertEq(book.traderCollateral(CALL_U, ALICE), 1_000e6 - 1e6, "collateral -= loss");
+        assertEq(book.traderCollateral(CALL_U, ALICE), 1_000e6 - expLoss, "collateral -= loss");
         assertEq(vault.coverHype(), coverBefore, "no cover sold on a loss");
         _assertConservation("after losing close");
 
-        // Trader withdraws the surviving 999 USDC from the EVM buffer.
+        // Trader withdraws the surviving collateral from the EVM buffer.
+        uint256 survivor = 1_000e6 - expLoss;
         vm.prank(ALICE);
-        book.withdraw(CALL, 999e6);
-        assertEq(usdc.balanceOf(ALICE), 999e6, "trader withdrew survivor collateral");
+        book.withdraw(CALL, survivor);
+        assertEq(usdc.balanceOf(ALICE), survivor, "trader withdrew survivor collateral");
         _assertConservation("after loss withdraw");
     }
 }

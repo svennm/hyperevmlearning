@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 import {ICoverVault} from "../src/interfaces/ICoverVault.sol";
 import {ISpotOracle} from "../src/interfaces/ISpotOracle.sol";
 
@@ -15,16 +16,19 @@ contract BookCallBackingTest is Test {
     EverlastingBook book;
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     address keeper = address(0xBEEF);
     address trader = address(0x7111);
 
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol(); // sigma=0.8e18
         // this = owner; caps 10e18; Kput/Wput/Kcall.
         book = new EverlastingBook(
             ICoverVault(address(vault)), ISpotOracle(address(oracle)),
-            keeper, 100e18, 20e18, 120e18, 10e18, 10e18
+            keeper, 100e18, 20e18, 120e18, 10e18, 10e18,
+            mockVol
         );
     }
 
@@ -37,11 +41,11 @@ contract BookCallBackingTest is Test {
         vault.setMockPx(50e18);
         vault.pullUsdc(address(this), 1_000_000e6); // pool USDC to fund the cover buy
         vault.buyCover(6e18, type(uint256).max);    // coverHype = 6e18
-        oracle.set(130e18);                         // call intrinsic = 10
-        vm.prank(keeper);
-        book.postMark(EverlastingBook.Side.COVERED_CALL, 15e18);
+        oracle.set(130e18);                         // call intrinsic = 10; fairMark(CALL) ≈ $14.6
+        book.accrue(EverlastingBook.Side.COVERED_CALL); // autonomous mark (permissionless)
         vm.prank(trader);
-        book.deposit(EverlastingBook.Side.COVERED_CALL, 90e6); // IM = 6·15 = 90
+        // IM = 6·mark ≈ 6·14.6 = 87.6e6; deposit 100e6 comfortably covers it.
+        book.deposit(EverlastingBook.Side.COVERED_CALL, 100e6);
         vm.prank(trader);
         book.openLong(EverlastingBook.Side.COVERED_CALL, 6e18);
 

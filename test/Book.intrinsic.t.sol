@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookIntrinsicTest
 /// @notice Tests for EverlastingBook.intrinsic(side):
@@ -14,6 +15,7 @@ import {MockOracle} from "../src/MockOracle.sol";
 contract BookIntrinsicTest is Test {
     MockCoverVault vault;
     MockOracle     oracle;
+    MockVol        mockVol;
     EverlastingBook book;
 
     // Strikes and cap for the default book under test
@@ -24,6 +26,7 @@ contract BookIntrinsicTest is Test {
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol(); // sigma=0.8e18, ready=true by default
         book   = new EverlastingBook(
             vault,
             oracle,
@@ -32,7 +35,8 @@ contract BookIntrinsicTest is Test {
             WPUT,
             KCALL,
             10_000e18,     // putCapNotional
-            10_000e18      // callCapNotional
+            10_000e18,     // callCapNotional
+            mockVol        // vol source (autonomous mark)
         );
         vault.setMockPx(100e18); // initial mock spot (not used by intrinsic — oracle is separate)
         oracle.set(100e18);      // initial oracle spot
@@ -138,10 +142,10 @@ contract BookIntrinsicTest is Test {
 
     // ── sideState independence ────────────────────────────────────────────────
 
-    /// @dev Write to the COVERED_CALL side via postMark and assert PUT state is not contaminated.
+    /// @dev Accrue the COVERED_CALL side and assert PUT state is not contaminated.
     function test_side_state_isolation() public {
-        // Post a mark on COVERED_CALL (oracle=100, Kcall=120 → intrinsic=0, mark=5e18 valid)
-        book.postMark(EverlastingBook.Side.COVERED_CALL, 5e18);
+        // Accrue COVERED_CALL (oracle=100, Kcall=120 → intrinsic=0, mark = computed fair value)
+        book.accrue(EverlastingBook.Side.COVERED_CALL);
 
         // PUT side must remain entirely zero
         (uint256 markP, uint256 lmtP, uint256 cfP, uint256 liP, uint256 nwP) =
@@ -152,9 +156,10 @@ contract BookIntrinsicTest is Test {
         assertEq(liP,   0, "put.lastIntrinsic");
         assertEq(nwP,   0, "put.netWritten");
 
-        // COVERED_CALL side must reflect the posted mark
+        // COVERED_CALL side must reflect the computed mark (fair value at S=100)
         (uint256 markC, , , , ) = book.sideState(uint8(EverlastingBook.Side.COVERED_CALL));
-        assertEq(markC, 5e18, "call.mark");
+        assertGt(markC, 0, "call.mark set");
+        assertEq(markC, book.fairMark(EverlastingBook.Side.COVERED_CALL), "call.mark == on-chain fair value");
     }
 
     // ── poolUsdc delegation ───────────────────────────────────────────────────

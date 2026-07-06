@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookInvariantHandler
 /// @notice Fuzz handler exercising the FULL two-sided EverlastingBook life-cycle on ONE shared
@@ -58,8 +59,8 @@ contract BookInvariantHandler is Test {
     ///         if a given run's random tail is quiet (Foundry reverts handler state between runs,
     ///         so afterInvariant sees the last run's counters, which now start from this baseline).
     function bootstrap() external {
-        try book.postMark(CALL, 5e18)  { marksCallPosted++; } catch {} // call OTM → intrinsic 0
-        try book.postMark(PUT, 20e18)  { marksPutPosted++; } catch {}  // put ATM → intrinsic 0
+        try book.accrue(CALL) { marksCallPosted++; } catch {} // mark = fairMark(CALL) on-chain
+        try book.accrue(PUT)  { marksPutPosted++; } catch {}  // mark = fairMark(PUT) on-chain
         try vault.buyCover(10e18, type(uint256).max) {} catch {}       // cover for the call
         try book.lpDeposit(200e6) {} catch {}                          // pool-free for the put escrow
 
@@ -115,35 +116,11 @@ contract BookInvariantHandler is Test {
     // (no dependence on the fuzzer happening to post a mark before the mark goes stale), so
     // the campaign is non-vacuous deterministically. Marks self-posted here also count.
 
-    /// @dev Best-effort post of a fresh mark for `side` at the current spot; counts on success.
+    /// @dev Refresh `side`'s mark to the on-chain fair value (permissionless accrue); counts on success.
+    ///      openLong auto-accrues too, but calling here keeps the non-vacuity mark counters live and
+    ///      guarantees mark > 0 before the open guard below.
     function _selfPostMark(EverlastingBook.Side side) internal {
-        uint8 s = uint8(side);
-        uint256 spot = oracle.spotWad();
-        (uint256 cm, uint256 lmt,,,) = book.sideState(s);
-        bool fresh = cm != 0 && block.timestamp <= lmt + book.MAX_MARK_AGE();
-        uint256 pm;
-        if (side == CALL) {
-            uint256 intr = spot > KCALL ? spot - KCALL : 0; // call intrinsic ≤ spot
-            if (!fresh) {
-                pm = spot > 0 ? spot : 1;                   // in [intr, spot], positive
-            } else {
-                pm = cm;                                    // 0% deviation re-post
-                if (pm < intr) pm = intr;                   // may exceed deviation → caught
-                if (pm > spot) pm = spot;
-            }
-        } else {
-            uint256 pv = spot >= KPUT ? 0 : KPUT - spot;
-            uint256 intr = pv > WPUT ? WPUT : pv;           // put intrinsic ≤ Wput
-            if (!fresh) {
-                pm = intr > 0 ? intr : (WPUT / 2);          // in [intr, Wput], positive
-            } else {
-                pm = cm;
-                if (pm < intr) pm = intr;
-                if (pm > WPUT) pm = WPUT;
-            }
-        }
-        if (pm == 0) return;
-        try book.postMark(side, pm) {
+        try book.accrue(side) {
             if (side == CALL) marksCallPosted++;
             else marksPutPosted++;
         } catch {}
@@ -151,8 +128,8 @@ contract BookInvariantHandler is Test {
 
     function openLongCall(uint256 seed, uint256 qty) external {
         _selfPostMark(CALL);
-        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(CALL_U);
-        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) return;
+        (uint256 mark,,,,) = book.sideState(CALL_U);
+        if (mark == 0) return;
         uint256 px = vault.spotPxUsdc();
         if (px == 0) return;
         qty = bound(qty, 1e17, 5e18);
@@ -175,8 +152,8 @@ contract BookInvariantHandler is Test {
 
     function openLongPut(uint256 seed, uint256 qty) external {
         _selfPostMark(PUT);
-        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(PUT_U);
-        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) return;
+        (uint256 mark,,,,) = book.sideState(PUT_U);
+        if (mark == 0) return;
         qty = bound(qty, 1e17, 5e18);
         address a = _actor(seed);
         (uint256 pq,,) = book.positions(PUT_U, a);
@@ -193,55 +170,16 @@ contract BookInvariantHandler is Test {
 
     // ── Mark posting (both sides) ─────────────────────────────────────────────
 
-    function postMarkCall(uint256 m) external {
-        uint256 spot = oracle.spotWad();
-        uint256 intr = spot > KCALL ? spot - KCALL : 0;       // call intrinsic (uncapped)
-        // Coverage (auditor gap #1): the on-chain fair-value band lets a keeper post a call mark up to
-        // ~1.1·spot (above the underlying). A winning close of such a mark needs a payout g that can
-        // EXCEED the cover-sale proceeds, forcing the pool to source the shortfall from poolFree() and
-        // hitting the fail-closed `require(poolFree() >= g)` (src:748). Cap at 1.1·spot (not spot) so the
-        // 128k-call conservation fuzz actually drives that branch — proving no underflow / no leak there.
-        uint256 scap = spot + spot / 10;                       // band ceiling (+10%)
-        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(CALL_U);
-
-        uint256 lo;
-        uint256 hi;
-        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) {
-            lo = intr;
-            hi = scap > intr ? scap : intr;
-        } else {
-            uint256 dhi = mark + mark * 2000 / 10000;
-            uint256 rawlo = mark >= mark * 2000 / 10000 ? mark - mark * 2000 / 10000 : 0;
-            lo = rawlo > intr ? rawlo : intr;
-            hi = dhi < scap ? dhi : scap;
-        }
-        if (hi < lo) hi = lo;
-        m = bound(m, lo, hi);
+    function postMarkCall(uint256) external {
+        // Autonomous mark: advance a funding period, then accrue (folds funding + refreshes
+        // mark = fairMark(CALL)). The spot driver (moveSpot/crashSpot) varies the mark, not a keeper.
         vm.warp(block.timestamp + book.FUNDING_PERIOD());
-        try book.postMark(CALL, m) { marksCallPosted++; } catch {}
+        try book.accrue(CALL) { marksCallPosted++; } catch {}
     }
 
-    function postMarkPut(uint256 m) external {
-        uint256 spot = oracle.spotWad();
-        uint256 pv = spot >= KPUT ? 0 : KPUT - spot;
-        uint256 intr = pv > WPUT ? WPUT : pv;                  // put intrinsic clamped at Wput
-        (uint256 mark, uint256 lastMarkTime,,,) = book.sideState(PUT_U);
-
-        uint256 lo;
-        uint256 hi;
-        if (mark == 0 || block.timestamp > lastMarkTime + book.MAX_MARK_AGE()) {
-            lo = intr;
-            hi = WPUT;                                         // put mark clamped at Wput
-        } else {
-            uint256 dhi = mark + mark * 2000 / 10000;
-            uint256 rawlo = mark >= mark * 2000 / 10000 ? mark - mark * 2000 / 10000 : 0;
-            lo = rawlo > intr ? rawlo : intr;
-            hi = dhi < WPUT ? dhi : WPUT;
-        }
-        if (hi < lo) hi = lo;
-        m = bound(m, lo, hi);
+    function postMarkPut(uint256) external {
         vm.warp(block.timestamp + book.FUNDING_PERIOD());
-        try book.postMark(PUT, m) { marksPutPosted++; } catch {}
+        try book.accrue(PUT) { marksPutPosted++; } catch {}
     }
 
     // ── Close / settle (both sides) ───────────────────────────────────────────
@@ -374,6 +312,7 @@ contract BookInvariantHandler is Test {
 contract BookInvariantTest is Test {
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     EverlastingBook book;
     BookInvariantHandler h;
 
@@ -388,17 +327,19 @@ contract BookInvariantTest is Test {
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
-        oracle.set(100e18);       // spot == Kput → put intrinsic 0, call OTM: first marks land wide
+        oracle.set(100e18);       // spot == Kput → put intrinsic 0, call OTM
         vault.setMockPx(100e18);  // cover price == underlying
+        mockVol = new MockVol();  // autonomous vol source (sigma=0.8e18, ready=true)
 
-        // Nonce-predict the handler so it becomes the keeper.
-        // After vault + oracle deploy, book deploys at getNonce(this); handler at +1 == predicted.
+        // Nonce-predict the handler so it becomes the keeper. Deploys so far: vault, oracle, mockVol;
+        // book deploys next at getNonce(this); handler at +1 == predicted.
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         book = new EverlastingBook(
             vault, oracle, predicted,
             KPUT, WPUT, KCALL,
             5_000_000e18, // putCapNotional (generous — opens reachable; cap logic unit-tested elsewhere)
-            5_000_000e18  // callCapNotional
+            5_000_000e18, // callCapNotional
+            mockVol       // autonomous mark: vol source (immutable)
         );
         h = new BookInvariantHandler(book, vault, oracle, actors);
         require(address(h) == predicted, "keeper wiring");

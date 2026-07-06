@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {MockCoverVault} from "../src/mocks/MockCoverVault.sol";
 import {MockOracle} from "../src/MockOracle.sol";
+import {MockVol} from "../src/mocks/MockVol.sol";
 
 /// @title BookReconcileTest
 /// @notice Task 7 async-reconciliation proof (D3 pre-funded-cover model): a COVERED_CALL can NEVER
@@ -15,6 +16,7 @@ import {MockOracle} from "../src/MockOracle.sol";
 contract BookReconcileTest is Test {
     MockCoverVault  vault;
     MockOracle      oracle;
+    MockVol         mockVol;
     EverlastingBook book;
 
     address constant ALICE = address(0xA11CE);
@@ -23,7 +25,6 @@ contract BookReconcileTest is Test {
     uint256 constant KPUT  = 100e18;
     uint256 constant WPUT  =  50e18;
     uint256 constant KCALL = 120e18;
-    uint256 constant MARK  =   5e18;   // call OTM (spot 100 < Kcall 120) → intrinsic 0
     uint256 constant HYPE_PX = 100e18; // $100 / HYPE (WAD)
 
     EverlastingBook.Side private constant CALL = EverlastingBook.Side.COVERED_CALL;
@@ -32,17 +33,19 @@ contract BookReconcileTest is Test {
     function setUp() public {
         vault  = new MockCoverVault();
         oracle = new MockOracle();
+        mockVol = new MockVol(); // sigma=0.8e18 ⇒ fairMark(CALL) ≈ $1.84 at S=100 (call OTM, intrinsic 0)
         book   = new EverlastingBook(
             vault, oracle, address(this),
             KPUT, WPUT, KCALL,
-            10_000e18, 10_000e18
+            10_000e18, 10_000e18,
+            mockVol
         );
         oracle.set(100e18);
         vault.setMockPx(HYPE_PX);
 
         // Seed pool USDC (for IM/deposits) but DELIBERATELY buy NO cover yet.
         vault.pullUsdc(address(0), 100_000e6);
-        book.postMark(CALL, MARK);
+        book.accrue(CALL); // establish the computed mark (spot 100 < Kcall 120 → intrinsic 0)
     }
 
     /// @dev D3: with vault.coverHype()=0 < netWritten(0) + qty(1e18), the write reverts "cover".

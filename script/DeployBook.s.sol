@@ -7,6 +7,7 @@ import {EvmUsdcCoverVault} from "../src/EvmUsdcCoverVault.sol";
 import {EverlastingBook} from "../src/EverlastingBook.sol";
 import {RealizedVol} from "../src/RealizedVol.sol";
 import {ISpotOracle} from "../src/interfaces/ISpotOracle.sol";
+import {IVolSource} from "../src/interfaces/IVolSource.sol";
 import {ICoverVault} from "../src/interfaces/ICoverVault.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {HLConstants} from "@hyper-evm-lib/src/common/HLConstants.sol";
@@ -39,26 +40,24 @@ contract DeployBook is Script {
         vm.startBroadcast(pk);
 
         OracleLib oracle = new OracleLib();                 // reads HYPE perp oracle (idx 135) -> WAD
+        // On-chain fair-value mark source: RealizedVol reads the same oracle. Constructed BEFORE the
+        // book because `vol` is an immutable ctor arg now (the autonomous mark reads σ from it).
+        RealizedVol vol = new RealizedVol(ISpotOracle(address(oracle)));
         // EVM-USDC custody vault: USDC = canonical HLConstants.usdc() so bridge path works;
         // owner = deployer, keeper = deployer (temp, reassigned to the book below).
         EvmUsdcCoverVault vault = new EvmUsdcCoverVault(IERC20(HLConstants.usdc()), deployer);
         EverlastingBook book = new EverlastingBook(
             ICoverVault(address(vault)),
             ISpotOracle(address(oracle)),
-            deployer,                                        // book keeper (posts marks)
-            Kput, Wput, Kcall, putCap, callCap
+            deployer,                                        // book keeper (cover-trigger role only)
+            Kput, Wput, Kcall, putCap, callCap,
+            IVolSource(address(vol))                          // autonomous mark: σ source (immutable)
         );
         // Wire the book as the vault's SOLE fund-exit authority (pullUsdc/payoutUsdc are onlyBook,
         // and sellCover is book-or-keeper). This is trustless custody: neither owner nor keeper can
         // move pooled USDC to an arbitrary recipient. The keeper stays = deployer (from the ctor) for
         // cover-buy / bridge ops, which are in-custody moves only.
         vault.initBook(address(book));
-
-        // On-chain fair-value mark: RealizedVol reads the same oracle; wire it into the book. Band
-        // stays inactive (bootstrap deviation cap) until the keeper cron has called updateVol() enough
-        // for vol.ready() — then postMark is bound to ±10% of the on-chain BS fair value (H2 fix).
-        RealizedVol vol = new RealizedVol(ISpotOracle(address(oracle)));
-        book.setVol(vol);
 
         vm.stopBroadcast();
 
