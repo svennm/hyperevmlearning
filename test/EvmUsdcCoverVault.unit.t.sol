@@ -251,4 +251,33 @@ contract EvmUsdcCoverVaultUnitTest is Test {
         vm.expectRevert(bytes("no ask"));
         vault.buyCover(0.2e18, 100e6);
     }
+
+    // ── Price quantization to HL's ≤5-sig-fig spot tick (found LIVE: unrounded prices 0-fill) ──
+
+    function test_quantizePrice_ceil_snapsBuyLimit() public view {
+        // live case: $54.999 ask ×1.005 = $55.273995 (×1e8 = 5527399492) → ceil to 5 sig-figs = $55.274
+        assertEq(vault.quantizePrice(5527399492, true), 5527400000, "buy ceil -> 5 sig-figs");
+        assertGe(vault.quantizePrice(5527399492, true), 5527399492, "ceil never lowers the buy limit");
+    }
+
+    function test_quantizePrice_floor_snapsSellLimit() public view {
+        // sell: $33.001 bid ×0.995 = $32.835995 (×1e8 = 3283599500) → floor to 5 sig-figs = $32.835
+        assertEq(vault.quantizePrice(3283599500, false), 3283500000, "sell floor -> 5 sig-figs");
+        assertLe(vault.quantizePrice(3283599500, false), 3283599500, "floor never raises the sell limit");
+    }
+
+    function test_quantizePrice_idempotentAndSmall() public view {
+        assertEq(vault.quantizePrice(5527400000, true), 5527400000, "already 5 sig-figs unchanged");
+        assertEq(vault.quantizePrice(50000, true), 50000, "<=5 digits unchanged");
+        assertEq(vault.quantizePrice(0, true), 0, "zero unchanged");
+    }
+
+    function test_quantizePrice_resultAlwaysAtMostFiveSigFigs() public view {
+        uint64[5] memory pxs = [uint64(5527399492), 3283599500, 999999999, 123456, 6331500000];
+        for (uint256 i = 0; i < pxs.length; i++) {
+            uint256 v = vault.quantizePrice(pxs[i], i % 2 == 0);
+            while (v >= 100000 && v % 10 == 0) v /= 10; // strip trailing zeros → mantissa
+            assertLt(v, 100000, "quantized result has <=5 significant figures");
+        }
+    }
 }

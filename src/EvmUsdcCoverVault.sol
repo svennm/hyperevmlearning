@@ -159,7 +159,23 @@ contract EvmUsdcCoverVault is ICoverVault {
         return _toUsdc(hype * pxWad / WAD);
     }
 
-    // ── ICoverVault: cover (byte-for-byte from CoreCoverVault) ────────────────
+    // ── ICoverVault: cover ────────────────────────────────────────────────────
+
+    /// @notice Quantize an ×1e8 price to HyperCore's spot tick: at most 5 significant figures.
+    ///         HyperCore SILENTLY rejects (0-fills) orders whose limit price exceeds 5 sig-figs, so
+    ///         both cover legs must snap their computed limit to a valid tick before submitting.
+    /// @param  roundUp true = ceil (marketable BUY — keep the limit ≥ ask); false = floor
+    ///         (marketable SELL — keep the limit ≤ bid). The rounding granularity (≤0.001% at ~$55)
+    ///         is far tighter than the ±COVER_CROSS_BPS buffer, so quantizing never uncrosses the book.
+    function quantizePrice(uint64 px, bool roundUp) public pure returns (uint64) {
+        uint256 p = px;
+        uint256 div = 1;
+        while (p / div >= 100000) { div *= 10; } // smallest 10^k s.t. p/div has ≤5 digits
+        if (div == 1) return px;                  // already ≤5 sig-figs
+        uint256 q = p / div;
+        if (roundUp && p % div != 0) q += 1;      // ceil for buys; floor otherwise
+        return uint64(q * div);
+    }
 
     /// @inheritdoc ICoverVault
     /// @dev Places a marketable IOC spot buy on HYPE_SPOT_ASSET, funded from the EXISTING Core-USDC
@@ -173,8 +189,9 @@ contract EvmUsdcCoverVault is ICoverVault {
         require(hypeWad > 0, "qty=0");
         PrecompileLib.Bbo memory q = PrecompileLib.bbo(uint64(HYPE_SPOT_ASSET));
         require(q.ask > 0, "no ask");
-        // ask ×1e6 → order limitPx ×1e8 (×100), plus a tiny fixed cross buffer.
-        uint64 limitPx = uint64(uint256(q.ask) * 100 * (10000 + COVER_CROSS_BPS) / 10000);
+        // ask ×1e6 → order limitPx ×1e8 (×100) + a tiny cross buffer, then quantized UP to HL's
+        // ≤5-sig-fig spot tick (unrounded prices are SILENTLY rejected by HyperCore — found live).
+        uint64 limitPx = quantizePrice(uint64(uint256(q.ask) * 100 * (10000 + COVER_CROSS_BPS) / 10000), true);
         // H4: worst-case spend at the LIMIT (not the stale bid) ≤ caller cap.
         uint256 limitPxWad = uint256(limitPx) * 1e10;
         uint256 worstCost  = _toUsdc(hypeWad * limitPxWad / WAD);
@@ -204,7 +221,8 @@ contract EvmUsdcCoverVault is ICoverVault {
         require(q.bid > 0, "no bid");
         usdcOut     = _toUsdc(floored * (uint256(q.bid) * 1e12) / WAD);
         uint64 sz   = uint64(floored / 1e10);
-        uint64 limitPx = uint64(uint256(q.bid) * 100 * (10000 - COVER_CROSS_BPS) / 10000);
+        // Quantized DOWN to HL's ≤5-sig-fig spot tick (unrounded prices are silently rejected).
+        uint64 limitPx = quantizePrice(uint64(uint256(q.bid) * 100 * (10000 - COVER_CROSS_BPS) / 10000), false);
         CoreWriterLib.placeLimitOrder(
             HYPE_SPOT_ASSET, false, limitPx, sz, false, HLConstants.LIMIT_ORDER_TIF_IOC, ++cloidSeq
         );
