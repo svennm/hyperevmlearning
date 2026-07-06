@@ -9,13 +9,12 @@ import {MockVol} from "../src/mocks/MockVol.sol";
 import {ICoverVault} from "../src/interfaces/ICoverVault.sol";
 import {ISpotOracle} from "../src/interfaces/ISpotOracle.sol";
 
-/// @notice Phase 2 — adaptive vol controller, on the autonomous mark (Task 5). A per-side integral
-///         term `adaptiveMult += k·(U − uStar)` per period scales σ (a σ level-shift), making the
-///         computed fair mark market-determined by pool fill-rate. Folded once per period inside the
-///         permissionless `accrue`. Default inert (k=0, mult=WAD). σ is supplied by a MockVol (constant
-///         0.8e18), so any fairMark movement here is driven purely by the adaptive multiplier — which
-///         is exactly what these tests isolate. Manip-proof (U needs real size), slow + clamped
-///         [MULT_MIN, MULT_MAX], σ re-clamped [SIGMA_FLOOR, SIGMA_CEIL].
+/// @notice Phase 2 — adaptive vol controller, on the autonomous mark (Task 6). A per-side integral
+///         term `adaptiveMult += ADAPT_K·(U − U_STAR)` per period scales σ, making the computed fair
+///         mark market-determined by pool fill-rate. Reworked for Task 6: ADAPT_K (0.02e18) and
+///         U_STAR (0.5e18) are now public constants; `setAdaptiveParams` and the `adaptiveK()`/`uStar()`
+///         getters were removed. The controller is ALWAYS ON. Tests use ADAPT_K=0.02e18, U_STAR=0.5e18:
+///         step per period = 0.02·(U − 0.5), clamped [MULT_MIN=0.5e18, MULT_MAX=3e18].
 contract BookAdaptiveTest is Test {
     EverlastingBook book;
     MockVol mockVol;
@@ -49,30 +48,36 @@ contract BookAdaptiveTest is Test {
         book.openLong(PUT, qty);
     }
 
-    // ── default inert ─────────────────────────────────────────────────────────
+    // ── controller inert when U == U_STAR ─────────────────────────────────────
+    // Controller is ALWAYS ON (ADAPT_K=0.02e18 constant). The accumulator stays at WAD only when
+    // utilization equals U_STAR exactly. Open 5e18 notional so U = 5/10 = 0.5 = U_STAR.
 
-    function test_adaptive_inertByDefault() public {
+    function test_adaptive_inertAtTarget() public {
+        assertEq(book.ADAPT_K(), 0.02e18, "ADAPT_K constant");
+        assertEq(book.U_STAR(), 0.5e18,   "U_STAR constant");
         assertEq(book.adaptiveMult(PUT_U), 1e18, "mult seeded to WAD");
-        assertEq(book.adaptiveK(), 0, "k off by default");
-        assertEq(book.uStar(), 0.5e18, "uStar default 0.5");
 
-        _accrue();                         // baseline mark (k=0, sets lastMarkTime)
+        _accrue();                         // baseline mark (sets lastMarkTime)
+        _openPut(5e18);                    // U = 5/10 = 0.5 = U_STAR exactly
+
         uint256 fairBefore = book.fairMark(PUT);
         for (uint256 i = 0; i < 5; i++) { skip(3600); _accrue(); }
 
-        assertEq(book.adaptiveMult(PUT_U), 1e18, "mult never moves while k=0");
-        assertEq(book.fairMark(PUT), fairBefore, "fair unchanged (sigma + mult stable)");
+        // step = ADAPT_K·(0.5 − 0.5) = 0 → mult never moves
+        assertEq(book.adaptiveMult(PUT_U), 1e18, "mult stays at WAD when U == U_STAR");
+        assertEq(book.fairMark(PUT), fairBefore, "fair unchanged when mult stable");
         assertEq(book.effectiveSigma(PUT), mockVol.sigma(), "mult==WAD means no sigma shift");
     }
 
     // ── over-target demand richens the mark (the integral climbs) ───────────────
+    // ADAPT_K=0.02, U=0.6, U_STAR=0.5 → step = 0.02·0.1 = 0.002/period.
+    // 3 periods → +0.006. (Formerly used setAdaptiveParams(0.05e18,…) → step=0.005, +0.015.)
 
     function test_adaptive_overTargetRaisesMark() public {
-        _accrue();                         // baseline (k=0)
-        _openPut(6e18);                    // U = 6/10 = 0.6 > uStar 0.5
+        _accrue();                         // baseline (sets lastMarkTime)
+        _openPut(6e18);                    // U = 6/10 = 0.6 > U_STAR 0.5
         assertEq(book.utilization(PUT), 0.6e18);
 
-        book.setAdaptiveParams(0.05e18, 0.5e18);
         uint256 multBefore = book.adaptiveMult(PUT_U);
         uint256 fairBefore = book.fairMark(PUT);
 
@@ -81,64 +86,50 @@ contract BookAdaptiveTest is Test {
         assertGt(book.adaptiveMult(PUT_U), multBefore, "mult climbed");
         assertGt(book.fairMark(PUT), fairBefore, "mark richened");
         assertGt(book.effectiveSigma(PUT), mockVol.sigma(), "mult>WAD lifts sigma above realized");
-        // 3 periods · k·(0.6−0.5) = 0.05·0.1 = 0.005 ⇒ +0.015
-        assertApproxEqAbs(book.adaptiveMult(PUT_U), 1e18 + 0.015e18, 1e15);
+        // 3 periods · ADAPT_K·(0.6−0.5) = 0.02·0.1 = 0.002 ⇒ +0.006
+        assertApproxEqAbs(book.adaptiveMult(PUT_U), 1e18 + 0.006e18, 1e15);
     }
 
     // ── under-target demand cheapens the mark ───────────────────────────────────
+    // ADAPT_K=0.02, U=0, U_STAR=0.5 → step = −0.01/period.
+    // 3 periods → −0.03. (Formerly used setAdaptiveParams(0.05e18,…) → step=−0.025, −0.075.)
 
     function test_adaptive_underTargetLowersMult() public {
         _accrue();                         // baseline; no position ⇒ U = 0
-        book.setAdaptiveParams(0.05e18, 0.5e18);
+
         uint256 multBefore = book.adaptiveMult(PUT_U);
 
         for (uint256 i = 0; i < 3; i++) { skip(3600); _accrue(); }
 
         assertLt(book.adaptiveMult(PUT_U), multBefore, "mult dropped");
-        // 3 periods · k·(0−0.5) = −0.025 ⇒ −0.075
-        assertApproxEqAbs(book.adaptiveMult(PUT_U), 1e18 - 0.075e18, 1e15);
+        // 3 periods · ADAPT_K·(0−0.5) = 0.02·(−0.5) = −0.01 ⇒ −0.03
+        assertApproxEqAbs(book.adaptiveMult(PUT_U), 1e18 - 0.03e18, 1e15);
     }
 
     // ── clamps ──────────────────────────────────────────────────────────────────
+    // ADAPT_K=0.02, U=0.8 (= U_MAX, max openable), U_STAR=0.5 → step = 0.02·0.3 = 0.006/period.
+    // Needs 334 periods to go from 1→3 (MULT_MAX). 400 periods ensures clamp is hit.
+    // (Formerly used setAdaptiveParams(0.1e18, 0.1e18) + U=0.9; U_MAX=0.8 caps qty at 8e18.)
 
     function test_adaptive_clampsAtMax() public {
         _accrue();
-        _openPut(9e18);                    // U = 0.9
-        assertEq(book.utilization(PUT), 0.9e18);
-        book.setAdaptiveParams(0.1e18, 0.1e18); // step = 0.1·(0.9−0.1) = 0.08 / period
+        _openPut(8e18);                    // U = 0.8 (= U_MAX, the hard cap)
+        assertEq(book.utilization(PUT), 0.8e18);
 
-        for (uint256 i = 0; i < 40; i++) { skip(3600); _accrue(); }
+        for (uint256 i = 0; i < 400; i++) { skip(3600); _accrue(); }
 
         assertEq(book.adaptiveMult(PUT_U), 3e18, "clamped at MULT_MAX");
     }
 
+    // ADAPT_K=0.02, U=0, U_STAR=0.5 → step = −0.01/period.
+    // Needs 50 periods to go from 1→0.5 (MULT_MIN). 60 periods ensures clamp is hit.
+    // (Formerly used setAdaptiveParams(0.1e18, 0.9e18) → step=−0.09, 20 periods sufficed.)
+
     function test_adaptive_clampsAtMin() public {
         _accrue();                         // U = 0
-        book.setAdaptiveParams(0.1e18, 0.9e18); // step = 0.1·(0−0.9) = −0.09 / period
 
-        for (uint256 i = 0; i < 20; i++) { skip(3600); _accrue(); }
+        for (uint256 i = 0; i < 60; i++) { skip(3600); _accrue(); }
 
         assertEq(book.adaptiveMult(PUT_U), 0.5e18, "clamped at MULT_MIN (sigma floor holds fairMark valid)");
-    }
-
-    // ── owner + hard-cap guards ─────────────────────────────────────────────────
-
-    function test_adaptive_setParams_guards() public {
-        vm.prank(address(0xBAD));
-        vm.expectRevert("only owner");
-        book.setAdaptiveParams(0.05e18, 0.5e18);
-
-        vm.expectRevert("k>max");
-        book.setAdaptiveParams(0.1e18 + 1, 0.5e18);
-
-        vm.expectRevert("uStar range");
-        book.setAdaptiveParams(0.05e18, 0);
-
-        vm.expectRevert("uStar range");
-        book.setAdaptiveParams(0.05e18, 1e18);
-
-        book.setAdaptiveParams(0.05e18, 0.5e18);
-        assertEq(book.adaptiveK(), 0.05e18);
-        assertEq(book.uStar(), 0.5e18);
     }
 }
